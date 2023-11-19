@@ -235,8 +235,8 @@ class LongitudinalMpc:
     self.tFollowSpeedRatio = 1.2
     self.tFollowGap1 = 1.1
     self.tFollowGap2 = 1.2
-    self.tFollowGap3 = 1.6
-    self.tFollowGap4 = 1.2
+    self.tFollowGap3 = 1.4
+    self.tFollowGap4 = 1.6
     self.stopDistance = STOP_DISTANCE
     self.softHoldTimer = 0
     self.lo_timer = 0 
@@ -273,6 +273,7 @@ class LongitudinalMpc:
     # self.solver = AcadosOcpSolverCython(MODEL_NAME, ACADOS_SOLVER_TYPE, N)
     self.solver.reset()
     # self.solver.options_set('print_level', 2)
+    self.x_solution = np.zeros(N+1)
     self.v_solution = np.zeros(N+1)
     self.a_solution = np.zeros(N+1)
     self.prev_a = np.array(self.a_solution)
@@ -289,6 +290,7 @@ class LongitudinalMpc:
     self.xState = XState.cruise
     self.startSignCount = 0
     self.stopSignCount = 0
+    self.vision_detected_count = 0
 
     for i in range(N+1):
       self.solver.set(i, 'x', np.zeros(X_DIM))
@@ -323,13 +325,13 @@ class LongitudinalMpc:
   def get_cost_multipliers(self, v_lead0, v_lead1):
     v_ego = self.x0[1]
     v_ego_bps = [0, 10]
-    TFs = [1.2, 1.45, 1.8]
+    TFs = [0.8, 1.2, 1.45] #[1.2, 1.45, 1.8]
     # KRKeegan adjustments to costs for different TFs
     # these were calculated using the test_longitudial.py deceleration tests
   #TF에 의한 a,j,d cost변경
-    a_change_tf = interp(self.t_follow, TFs, [.8, 1., 1.1]) # 가까울수록 작게
-    j_ego_tf = interp(self.t_follow, TFs, [.8, 1., 1.1]) #가까울수록 작게
-    d_zone_tf = interp(self.t_follow, TFs, [1.3, 1., 1.]) # 가까울수록 크게
+    a_change_tf = interp(self.t_follow, TFs, [.9, 1., 1.0]) # 가까울수록 작게 #interp(self.t_follow, TFs, [.8, 1., 1.1]) # 가까울수록 작게
+    j_ego_tf = interp(self.t_follow, TFs, [.5, 1., 1.0]) #가까울수록 작게 interp(self.t_follow, TFs, [.8, 1., 1.1]) #가까울수록 작게
+    d_zone_tf = interp(self.t_follow, TFs, [1.1, 1., 1.0]) # 가까울수록 크게interp(self.t_follow, TFs, [1.3, 1., 1.]) # 가까울수록 크게
 
     # KRKeegan adjustments to improve sluggish acceleration
     # do not apply to deceleration
@@ -421,7 +423,7 @@ class LongitudinalMpc:
     lead_xv_0 = self.process_lead(radarstate.leadOne)
     lead_xv_1 = self.process_lead(radarstate.leadTwo)
 
-    self.update_gap_tf(controls, radarstate, v_ego, a_ego)
+    self.update_gap_tf(controls, v_ego, a_ego)
 
     self.comfort_brake = COMFORT_BRAKE
     #self.set_weights(prev_accel_constraint=prev_accel_constraint, v_lead0=lead_xv_0[0,1], v_lead1=lead_xv_1[0,1])
@@ -545,6 +547,7 @@ class LongitudinalMpc:
     for i in range(N):
       self.u_sol[i] = self.solver.get(i, 'u')
 
+    self.x_solution = self.x_sol[:,0]
     self.v_solution = self.x_sol[:,1]
     self.a_solution = self.x_sol[:,2]
     self.j_solution = self.u_sol[:,0]
@@ -591,38 +594,33 @@ class LongitudinalMpc:
       self.applyModelDistOrder = int(Params().get("ApplyModelDistOrder", encoding="utf8"))
       self.trafficStopAdjustRatio = float(int(Params().get("TrafficStopAdjustRatio", encoding="utf8"))) / 100.
 
-  def update_gap_tf(self, controls, radarstate, v_ego, a_ego):
+  def update_gap_tf(self, controls, v_ego, a_ego):
     v_ego_kph = v_ego * CV.MS_TO_KPH
-    #if controls.longCruiseGap >= 4:
-    #  if v_ego_kph > self.v_ego_kph_prev:  ##감속할때 gap을 줄이면.. 앞차로 너무 다가가는 경향이... 가속할때만... 자동gap
-    #    self.applyCruiseGap = interp(v_ego_kph, [0, 45, 60, 100, 120, 140], [1,1,2,2,3,4])
-    #  cruiseGapRatio = interp(self.applyCruiseGap, [1,2,3,4], [1.1, 1.2, 1.3, 1.45])
-    #  self.applyCruiseGap = clip(self.applyCruiseGap, 1, 4)
-    #else:
-    #  self.applyCruiseGap = float(controls.longCruiseGap)
-    #  cruiseGapRatio = interp(controls.longCruiseGap, [1,2,3], [1.1, 1.3, 1.6])
 
-    if v_ego_kph >= self.v_ego_kph_prev: # 감속일때는 t_follow(gap) 계산안함.
-      self.applyCruiseGap = clip(controls.longCruiseGap, 1, 4)
-      cruiseGap_dict = {
-        1: self.tFollowGap1,
-        2: self.tFollowGap2,
-        3: self.tFollowGap3,
-        4: self.tFollowGap4,
-        }
-      tf = cruiseGap_dict[self.applyCruiseGap]
-      cruiseGapRatio = interp(v_ego_kph, [0, 100], [tf, tf * self.tFollowSpeedRatio]) 
-      self.t_follow = max(0.9, cruiseGapRatio * (2.0 - self.mySafeModeFactor)) # 0.9아래는 위험하니 적용안함.
-
-    self.v_ego_kph_prev = v_ego_kph
-
-    # lead값을 고의로 줄여주면, 빨리 감속, lead값을 늘려주면 빨리가속,
-    if radarstate.leadOne.status:
-      if not self.openpilotLongitudinalControl:
+    self.applyCruiseGap = clip(controls.longCruiseGap, 1, 4)
+    if self.openpilotLongitudinalControl:
+      if v_ego_kph >= self.v_ego_kph_prev: # 감속일때는 t_follow(gap) 계산안함.
+        cruiseGap_dict = {
+          1: self.tFollowGap1,
+          2: self.tFollowGap2,
+          3: self.tFollowGap3,
+          4: self.tFollowGap4,
+          }
+        tf = cruiseGap_dict[self.applyCruiseGap]
+        cruiseGapRatio = interp(v_ego_kph, [0, 100], [tf, tf * self.tFollowSpeedRatio]) 
+        self.t_follow = max(0.9, cruiseGapRatio * (2.0 - self.mySafeModeFactor)) # 0.9아래는 위험하니 적용안함.
+    else:
+      if self.status:
         if v_ego_kph < 0.1:
           self.applyCruiseGap = 1
         else:
-          self.applyCruiseGap = int(interp(a_ego, [-1.5, -0.5], [3, self.applyCruiseGap]))
+          self.applyCruiseGap = int(interp(a_ego, [-1.5, -0.5], [4, self.applyCruiseGap]))
+      #else: # for Test
+      #  self.applyCruiseGap = int(interp(v_ego * 3.6, [0, 60], [1, 4]))
+
+
+    self.v_ego_kph_prev = v_ego_kph
+
 
   def update_stop_dist(self, stop_x):
     stop_x = self.xStopFilter.process(stop_x, median = True)
@@ -827,7 +825,10 @@ class LongitudinalMpc:
         stop_x = 1000.0
 
     if self.trafficStopMode > 0:
-      if self.trafficStopMode == 2:
+      if self.trafficStopMode == 3:
+        self.vision_detected_count = self.vision_detected_count + 1 if radarstate.leadOne.dRel < 90 and radarstate.leadOne.status and not radarstate.leadOne.radar else 0
+        mode = 'blended' if self.xState in [XState.e2eCruisePrepare] or self.vision_detected_count >= 0.5 * DT_MDL else 'acc'
+      elif self.trafficStopMode == 2:
         mode = 'blended' if self.xState in [XState.e2eCruisePrepare] else 'acc'
       else:
         if self.xState == XState.e2eCruisePrepare or (self.xState == XState.e2eStop and self.stopDist > 40):
@@ -845,7 +846,7 @@ class LongitudinalMpc:
     elif stop_x == 1000.0:
       self.stopDist = 0.0
     elif self.stopDist > 0:
-      stop_dist = v_ego ** 2 / (2.0 * 2)
+      stop_dist = v_ego ** 2 / (2.5 * 2)
       self.stopDist = self.stopDist if self.stopDist > stop_dist else stop_dist
       stop_x = 0.0
 #    else:

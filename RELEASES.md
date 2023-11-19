@@ -1,3 +1,10 @@
+231117 - APILOT
+* ModelSelect: from FrogPilot
+
+231011 - APILOT
+* CANCEL버튼으로 롱컨 해제기능
+  * 한번더 누르면 인게이지해제
+
 231008 - APILOT
 * 설정고정
   * Jerk dynamic control: 고정

@@ -1,33 +1,36 @@
-import os, time, ctypes, hashlib, subprocess, platform
-import numpy as np
-from collections import defaultdict
-from typing import Final, Dict
-from tinygrad.ops import CompiledBuffer, RawBufferCopyIn
-from tinygrad.codegen.gpu import GPUCodegen, GPULanguage
+import time, ctypes, subprocess, platform, functools, pathlib, tempfile
+from typing import Any
+from tinygrad.ops import Compiled
+from tinygrad.helpers import diskcache
+from tinygrad.runtime.lib import RawMallocBuffer
+from tinygrad.codegen.kernel import LinearizerOptions
+from tinygrad.renderer.cstyle import uops_to_cstyle, CStyleLanguage
 
-class RawMallocBuffer(RawBufferCopyIn):
-  def __init__(self, size): self._buf = (ctypes.c_float * (size//4))()
-  def copyin(self, x:np.ndarray): ctypes.memmove(self._buf, x.ctypes.data, x.size*4)
-  def toCPU(self): return np.ctypeslib.as_array(self._buf)
+args = {
+  'Linux': {'cflags':'-lm -fPIC --rtlib=compiler-rt ', 'ext':'so'},
+  'Darwin': {'cflags':'-lm -fPIC --rtlib=compiler-rt ', 'ext':'dylib'}
+}[platform.system()]
+
+CLANG_PROGRAM_HEADER = '#include <math.h>\n#define max(x,y) ((x>y)?x:y)\n#define int64 long\n#define half __fp16\n#define uchar unsigned char\n#include <stdbool.h>\n'
+
+@diskcache
+def compile_clang(prg:str, header:str=CLANG_PROGRAM_HEADER) -> bytes:
+  # TODO: remove file write. sadly clang doesn't like the use of /dev/stdout here
+  with tempfile.NamedTemporaryFile(delete=True) as output_file:
+    subprocess.check_output(args=('clang -shared -O2 -Wall -Werror -x c '+args['cflags']+' - -o '+str(output_file.name)).split(), input=(header+prg).encode('utf-8'))
+    return pathlib.Path(output_file.name).read_bytes()
 
 class ClangProgram:
-  kernel_cnt : Final[Dict[str, int]] = defaultdict(int)
-  def __init__(self, name:str, prg:str):
-    prg = "#include <math.h>\n#define max(x,y) ((x>y)?x:y)\n" + prg
-    # TODO: is there a way to not write this to disk?
-    fn = f"/tmp/clang_{hashlib.md5(prg.encode('utf-8')).hexdigest()}.{'dylib' if platform.system() == 'Darwin' else 'so'}"
-    if not os.path.exists(fn):
-      subprocess.check_output(['clang', '-shared', '-O2', '-Wall','-Werror', '-lm', '-fPIC', '-x', 'c', '-', '-o', fn+".tmp"], input=prg.encode('utf-8'))
-      os.rename(fn+".tmp", fn)
-    self.lib = ctypes.CDLL(fn)
-    self.fxn = self.lib[name]
+  def __init__(self, name:str, prg:bytes):
+    # write to disk so we can load it
+    with tempfile.NamedTemporaryFile(delete=True) as cached_file_path:
+      pathlib.Path(cached_file_path.name).write_bytes(prg)
+      self.fxn: Any = ctypes.CDLL(str(cached_file_path.name))[name]
+
   def __call__(self, *args, wait=False):
-    if wait: st = time.monotonic()
-    self.fxn(*[x._buf for x in args[2:]])
-    if wait: return time.monotonic()-st
+    if wait: st = time.perf_counter()
+    self.fxn(*[x._buf if isinstance(x, RawMallocBuffer) else x for x in args])
+    if wait: return time.perf_counter()-st
 
-class ClangCodegen(GPUCodegen):
-  lang = GPULanguage(buffer_suffix="restrict")
-
-class ClangBuffer(CompiledBuffer):
-  raw_buffer_type, codegen_type, runtime_type = RawMallocBuffer, ClangCodegen, ClangProgram
+renderer = functools.partial(uops_to_cstyle, CStyleLanguage(buffer_suffix=" restrict", arg_int_prefix="const int"))
+ClangBuffer = Compiled(RawMallocBuffer, LinearizerOptions(supports_float4=False, has_local=False), renderer, compile_clang, ClangProgram)

@@ -113,7 +113,7 @@ addr_checks hyundai_rx_checks = {hyundai_addr_checks, HYUNDAI_ADDR_CHECK_LEN};
 static uint8_t hyundai_get_counter(CANPacket_t *to_push) {
   int addr = GET_ADDR(to_push);
 
-  uint8_t cnt;
+  uint8_t cnt = 0;
   if (addr == 608) {
     cnt = (GET_BYTE(to_push, 7) >> 4) & 0x3U;
   } else if (addr == 902) {
@@ -125,7 +125,6 @@ static uint8_t hyundai_get_counter(CANPacket_t *to_push) {
   } else if (addr == 1265) {
     cnt = (GET_BYTE(to_push, 3) >> 4) & 0xFU;
   } else {
-    cnt = 0;
   }
   return cnt;
 }
@@ -133,7 +132,7 @@ static uint8_t hyundai_get_counter(CANPacket_t *to_push) {
 static uint32_t hyundai_get_checksum(CANPacket_t *to_push) {
   int addr = GET_ADDR(to_push);
 
-  uint8_t chksum;
+  uint8_t chksum = 0;
   if (addr == 608) {
     chksum = GET_BYTE(to_push, 7) & 0xFU;
   } else if (addr == 902) {
@@ -143,7 +142,6 @@ static uint32_t hyundai_get_checksum(CANPacket_t *to_push) {
   } else if (addr == 1057) {
     chksum = GET_BYTE(to_push, 7) >> 4;
   } else {
-    chksum = 0;
   }
   return chksum;
 }
@@ -336,16 +334,17 @@ static int hyundai_tx_hook(CANPacket_t *to_send) {
   }
 
   // BUTTONS: used for resume spamming and cruise cancellation
-  /*if ((addr == 1265) && !hyundai_longitudinal) {
+  if ((addr == 1265) && !hyundai_longitudinal) {
     int button = GET_BYTE(to_send, 0) & 0x7U;
 
     bool allowed_resume = (button == 1) && controls_allowed;
     bool allowed_set_decel = (button == 2) && controls_allowed;
     bool allowed_cancel = (button == 4) && cruise_engaged_prev;
-    if (!(allowed_resume || allowed_set_decel || allowed_cancel)) {
+    bool allowed_gap_dist = (button == 3) && controls_allowed;
+    if (!(allowed_resume || allowed_set_decel || allowed_cancel || allowed_gap_dist)) {
       tx = 0;
     }
-  }*/
+  }
 
   if(addr == 832)
     last_ts_lkas11_from_op = (tx == 0 ? 0 : microsecond_timer_get());

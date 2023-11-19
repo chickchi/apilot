@@ -76,7 +76,6 @@ def manager_init() -> None:
     ("AutoResumeFromGasSpeed", "30"),
     ("AutoResumeFromGasSpeedMode", "0"),    
     ("AutoCancelFromGasMode", "1"),    
-    ("OpkrPrebuiltOn", "0"),
     ("AutoCurveSpeedCtrlUse", "1"),
     ("AutoCurveSpeedFactor", "100"),
     ("AutoCurveSpeedFactorIn", "10"),
@@ -89,7 +88,7 @@ def manager_init() -> None:
     ("AutoNaviSpeedCtrlMode", "0"),
     ("AutoNaviSpeedCtrlStart", "22"),
     ("AutoNaviSpeedCtrlEnd", "6"),
-    ("AutoNaviSpeedBumpDist", "10"),
+    ("AutoNaviSpeedBumpTime", "1"),
     ("AutoNaviSpeedBumpSpeed", "35"),
     ("AutoNaviSpeedSafetyFactor", "105"),
     ("AutoNaviSpeedDecelRate", "80"),
@@ -101,8 +100,8 @@ def manager_init() -> None:
     ("AutoResumeFromBrakeReleaseTrafficSign", "1"),
     ("LongControlActiveSound", "1"),
     ("StartAccelApply", "0"),
-    ("StopAccelApply", "30"),
-    ("TrafficStopDistanceAdjust", "400"),
+    ("StopAccelApply", "50"),
+    ("TrafficStopDistanceAdjust", "180"),
     ("AutoSpeedUptoRoadSpeedLimit", "100"),
     ("ApplyLongDynamicCost", "0"), 
     ("AutoSpeedAdjustWithLeadCar", "0"),   
@@ -111,10 +110,10 @@ def manager_init() -> None:
     ("TrafficStopMode", "2"),         
     ("CruiseButtonMode", "0"),      
     ("CruiseSpeedUnit", "10"),      
-    ("GapButtonMode", "0"),      
     ("InitMyDrivingMode", "3"),      
     ("MySafeModeFactor", "80"),      
     ("LiveSteerRatioApply", "100"),      
+    ("LiveTorqueCache", "0"),      
     ("MyEcoModeFactor", "80"),  
     ("CruiseMaxVals1", "160"),
     ("CruiseMaxVals2", "120"),
@@ -125,7 +124,7 @@ def manager_init() -> None:
     ("PrevCruiseGap", "4"),      
     ("CruiseSpeedMin", "10"),
     ("AutoSyncCruiseSpeedMax", "120"),       
-    ("StopDistance", "600"), 
+    ("StopDistance", "550"), 
     ("CustomMapbox", "0"),    
     ("LongitudinalTuningKpV", "100"),     
     ("LongitudinalTuningKiV", "200"),     
@@ -139,31 +138,26 @@ def manager_init() -> None:
     ("TFollowSpeedRatio", "110"),
     ("TFollowGap1", "110"),
     ("TFollowGap2", "120"),
-    ("TFollowGap3", "160"),
-    ("TFollowGap4", "120"),
+    ("TFollowGap3", "140"),
+    ("TFollowGap4", "160"),
     ("JerkStartLimit", "10"),    
     ("KeepEngage", "1"),
-    ("UseLaneLineSpeed", "0"),    
-    ("PathOffset", "0"),  
-    ("PathCostApply", "100"),
     ("HapticFeedbackWhenSpeedCamera", "0"),       
     ("MaxAngleFrames", "89"),       
     ("SoftHoldMode", "1"),       
     ("ApplyModelDistOrder", "30"),       
     ("TrafficStopAdjustRatio", "90"),       
-    ("SteeringRateCost", "700"),       
-    ("LateralMotionCost", "11"),       
-    ("LateralAccelCost", "0"),       
-    ("LateralJerkCost", "5"),       
     ("LateralTorqueCustom", "0"),       
     ("LateralTorqueAccelFactor", "2500"),       
     ("LateralTorqueFriction", "100"),       
-    ("SteerActuatorDelay", "30"),       
+    ("SteerActuatorDelay", "40"),       
     ("CruiseControlMode", "4"),
     ("CruiseOnDist", "0"),
     ("SteerRatioApply", "0"),
     ("SteerDeltaUp", "3"),       
-    ("SteerDeltaDown", "7"),       
+    ("SteerDeltaDown", "7"),     
+    ("AverageCurvature", "0"),
+    ("Model", "1"),
   ]
   if not PC:
     default_params.append(("LastUpdateTime", datetime.datetime.utcnow().isoformat().encode('utf8')))
@@ -312,20 +306,12 @@ def manager_thread() -> None:
 
 
 def main() -> None:
-  preBuiltOn = Params().get_bool("OpkrPrebuiltOn")
-  preBuiltFile = '/data/openpilot/prebuilt'
-  if not os.path.isdir("/data/openpilot"):
-      pass
-  elif not os.path.isfile(preBuiltFile) and preBuiltOn:
-    os.system("cd /data/openpilot; touch prebuilt")
-  elif os.path.isfile(preBuiltFile) and not preBuiltOn:
-    os.system("cd /data/openpilot; rm -f prebuilt")
-
   prepare_only = os.getenv("PREPAREONLY") is not None
 
   manager_init()
   os.system("python /data/openpilot/selfdrive/car/hyundai/values.py > /data/params/d/SupportedCars")
   os.system("python /data/openpilot/selfdrive/car/gm/values.py > /data/params/d/SupportedCars_gm")
+  subprocess.run(["python3", "/data/openpilot/selfdrive/modeld/model_switcher.py"])
 
   # Start UI early so prepare can happen in the background
   if not prepare_only:

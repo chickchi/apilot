@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 import os
-import sys
 import signal
 import numpy as np
 from collections import deque, defaultdict
+from functools import partial
 
 import cereal.messaging as messaging
 from cereal import car, log
-from openpilot.common.params import Params, put_nonblocking
-from openpilot.common.realtime import config_realtime_process, DT_MDL, Priority
+from openpilot.common.params import Params
+from openpilot.common.realtime import config_realtime_process, DT_MDL
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.system.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.vehicle_model import ACCELERATION_DUE_TO_GRAVITY
+from openpilot.selfdrive.locationd.helpers import PointBuckets, ParameterEstimator, cache_points_onexit, cache_points_runtime
 
 HISTORY = 5  # secs
 POINTS_PER_BUCKET = 1500
@@ -43,64 +44,20 @@ def slope2rot(slope):
   return np.array([[cos, -sin], [sin, cos]])
 
 
-class NPQueue:
-  def __init__(self, maxlen, rowsize):
-    self.maxlen = maxlen
-    self.arr = np.empty((0, rowsize))
-
-  def __len__(self):
-    return len(self.arr)
-
-  def append(self, pt):
-    if len(self.arr) < self.maxlen:
-      self.arr = np.append(self.arr, [pt], axis=0)
-    else:
-      self.arr[:-1] = self.arr[1:]
-      self.arr[-1] = pt
-
-
-class PointBuckets:
-  def __init__(self, x_bounds, min_points, min_points_total):
-    self.x_bounds = x_bounds
-    self.buckets = {bounds: NPQueue(maxlen=POINTS_PER_BUCKET, rowsize=3) for bounds in x_bounds}
-    self.buckets_min_points = dict(zip(x_bounds, min_points, strict=True))
-    self.min_points_total = min_points_total
-
-  def bucket_lengths(self):
-    return [len(v) for v in self.buckets.values()]
-
-  def __len__(self):
-    return sum(self.bucket_lengths())
-
-  def is_valid(self):
-    #print ("buckets=", self.bucket_lengths(), self.__len__())
-    return all(len(v) >= min_pts for v, min_pts in zip(self.buckets.values(), self.buckets_min_points.values(), strict=True)) \
-                                                                                and (self.__len__() >= self.min_points_total)
-  def bucket_lengths_str(self):
-    return ','.join([str(x) for x in self.bucket_lengths()])                   
-
+class TorqueBuckets(PointBuckets):
   def add_point(self, x, y):
     for bound_min, bound_max in self.x_bounds:
       if (x >= bound_min) and (x < bound_max):
         self.buckets[(bound_min, bound_max)].append([x, 1.0, y])
         break
 
-  def get_points(self, num_points=None):
-    points = np.vstack([x.arr for x in self.buckets.values()])
-    if num_points is None:
-      return points
-    return points[np.random.choice(np.arange(len(points)), min(len(points), num_points), replace=False)]
 
-  def load_points(self, points):
-    for x, y in points:
-      self.add_point(x, y)
-
-
-class TorqueEstimator:
+class TorqueEstimator(ParameterEstimator):
   def __init__(self, CP, decimated=False):
     self.hist_len = int(HISTORY / DT_MDL)
     #self.lag = CP.steerActuatorDelay + .2   # from controlsd
     self.lag = float(int(Params().get("SteerActuatorDelay", encoding="utf8"))) / 100.
+    
     if decimated:
       self.min_bucket_points = MIN_BUCKET_POINTS / 10
       self.min_points_total = MIN_POINTS_TOTAL_QLOG
@@ -140,7 +97,7 @@ class TorqueEstimator:
 
     # try to restore cached params
     params = Params()
-    params_cache = params.get("LiveTorqueCarParams")
+    params_cache = params.get("CarParamsPrevRoute")
     torque_cache = params.get("LiveTorqueParameters")
     if params_cache is not None and torque_cache is not None:
       try:
@@ -161,7 +118,6 @@ class TorqueEstimator:
           cloudlog.info("restored torque params from cache")
       except Exception:
         cloudlog.exception("failed to restore cached torque params")
-        params.remove("LiveTorqueCarParams")
         params.remove("LiveTorqueParameters")
 
     self.filtered_params = {}
@@ -179,7 +135,11 @@ class TorqueEstimator:
     self.resets += 1.0
     self.decay = MIN_FILTER_DECAY
     self.raw_points = defaultdict(lambda: deque(maxlen=self.hist_len))
-    self.filtered_points = PointBuckets(x_bounds=STEER_BUCKET_BOUNDS, min_points=self.min_bucket_points, min_points_total=self.min_points_total)
+    self.filtered_points = TorqueBuckets(x_bounds=STEER_BUCKET_BOUNDS,
+                                         min_points=self.min_bucket_points,
+                                         min_points_total=self.min_points_total,
+                                         points_per_bucket=POINTS_PER_BUCKET,
+                                         rowsize=3)
 
   def estimate_params(self):
     points = self.filtered_points.get_points(self.fit_points)
@@ -247,8 +207,7 @@ class TorqueEstimator:
     else:
       liveTorqueParameters.liveValid = False
 
-    #print(self.filtered_points.bucket_lengths_str())
-    liveTorqueParameters.debugText = self.filtered_points.bucket_lengths_str()
+    liveTorqueParameters.debugText = "LiveTorque:" + "Valid" if liveTorqueParameters.liveValid else "Invalid"
 
     if with_points:
       liveTorqueParameters.points = self.filtered_points.get_points()[:, [0, 2]].tolist()
@@ -262,32 +221,18 @@ class TorqueEstimator:
     return msg
 
 
-def main(sm=None, pm=None):
+def main():
   config_realtime_process([0, 1, 2, 3], 5)
 
-  if sm is None:
-    sm = messaging.SubMaster(['carControl', 'carState', 'liveLocationKalman'], poll=['liveLocationKalman'])
-
-  if pm is None:
-    pm = messaging.PubMaster(['liveTorqueParameters'])
+  pm = messaging.PubMaster(['liveTorqueParameters'])
+  sm = messaging.SubMaster(['carControl', 'carState', 'liveLocationKalman'], poll=['liveLocationKalman'])
 
   params = Params()
   with car.CarParams.from_bytes(params.get("CarParams", block=True)) as CP:
     estimator = TorqueEstimator(CP)
 
-  def cache_params(sig, frame):
-    signal.signal(sig, signal.SIG_DFL)
-    cloudlog.warning("caching torque params")
-
-    params = Params()
-    params.put("LiveTorqueCarParams", CP.as_builder().to_bytes())
-
-    msg = estimator.get_msg(with_points=True)
-    params.put("LiveTorqueParameters", msg.to_bytes())
-
-    sys.exit(0)
   if "REPLAY" not in os.environ:
-    signal.signal(signal.SIGINT, cache_params)
+    signal.signal(signal.SIGINT, partial(cache_points_onexit, "LiveTorqueParameters", estimator))
 
   while True:
     sm.update()
@@ -301,11 +246,12 @@ def main(sm=None, pm=None):
     if sm.frame % 5 == 0:
       pm.send('liveTorqueParameters', estimator.get_msg(valid=sm.all_checks()))
       
-    # dp - auto save every 3 mins: 4 hz * 60 * 3 = 720 (3 mins)
-    if sm.frame % 720 == 0:
-      put_nonblocking("LiveTorqueCarParams", CP.as_builder().to_bytes())
-      msg = estimator.get_msg(with_points=True)
-      put_nonblocking("LiveTorqueParameters", msg.to_bytes())
+    elif sm.frame % 720 == 0:
+      liveTorqueCache = int(Params().get("LiveTorqueCache"))
+      if liveTorqueCache == 1:
+        print("caching live torque params....")
+        cache_points_runtime("LiveTorqueParameters", estimator)
+
 
 if __name__ == "__main__":
   main()

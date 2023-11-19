@@ -14,6 +14,7 @@ from openpilot.common.numpy_fast import clip
 from openpilot.common.conversions import Conversions as CV
 from openpilot.system.hardware import TICI
 from openpilot.common.params import Params
+import subprocess
 
 CAMERA_SPEED_FACTOR = 1.05
 
@@ -136,7 +137,7 @@ class RoadLimitSpeedServer:
             if broadcast_address is None or frame % 10 == 0:
               broadcast_address = self.get_broadcast_address()
 
-            print('broadcast_address', broadcast_address)
+            #print('broadcast_address', broadcast_address)
 
             if broadcast_address is not None:
               address = (broadcast_address, Port.BROADCAST_PORT)
@@ -178,6 +179,15 @@ class RoadLimitSpeedServer:
         if 'cmd' in json_obj:
           try:
             os.system(json_obj['cmd'])
+            ret = False
+          except:
+            pass
+
+        if 'cmd_eco' in json_obj:
+          try:
+            process = subprocess.Popen([json_obj['cmd_eco']], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdout, stderr = process.communicate()
+            sock.sendto(stdout.encode(), self.remote_addr[0])
             ret = False
           except:
             pass
@@ -466,7 +476,7 @@ def main():
           if xSpdDist < 0:
             xSpdLimit = -1
 
-        if xTurnInfo >= 0:
+        if True: #xTurnInfo >= 0:
           xDistToTurn -= delta_dist
           if xDistToTurn < 0:
             xTurnInfo = -1
@@ -506,16 +516,18 @@ def main():
         elif nTBTTurnType in [13, 19]:
           xTurnInfo = 2  # turn right
         #elif nTBTTurnType in [7, 44, 17, 75, 102, 105, 112, 115, 76, 118]: # left lanechange
-        elif nTBTTurnType in [7, 17, 102, 105, 112, 115, 76, 118]: # left lanechange
+        elif nTBTTurnType in [7, 44, 17, 75, 102, 105, 112, 115, 76]: # left lanechange
           xTurnInfo = 3  # slight left
         #elif nTBTTurnType in [6, 43, 73, 74, 101, 104, 111, 114, 123, 124, 117]: # right lanechange
-        elif nTBTTurnType in [6, 43, 73, 74, 101, 104, 111, 114]: # right lanechange
+        elif nTBTTurnType in [6, 43, 73, 74, 101, 104, 111, 114, 123, 124]: # right lanechange
           xTurnInfo = 4  # slight right
         elif nTBTTurnType in [14, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142]:
           xTurnInfo = 5 # speed down
+        elif nTBTTurnType in [153, 154, 249]: # TG
+          xTurnInfo = 5 # speed down
         elif nTBTTurnType >= 0:
           xTurnInfo = -1
-        if nTBTDist > 0:
+        if nTBTDist > 0 and xTurnInfo >= 0:
           xDistToTurn = nTBTDist
         sdi_valid = True if nRoadLimitSpeed >= 0 or nTBTTurnType > 0 or nSdiType >= 0 else False
         if nRoadLimitSpeed > 0:
@@ -593,7 +605,7 @@ def main():
         dat.roadLimitSpeed.xRoadLimitSpeed = int(xRoadLimitSpeed)
         if xRoadLimitSpeed > 0:
           dat.roadLimitSpeed.roadLimitSpeed = int(xRoadLimitSpeed)
-        dat.roadLimitSpeed.xRoadName = xRoadName # + sdiDebugText
+        dat.roadLimitSpeed.xRoadName = xRoadName + sdiDebugText
 
         dat.roadLimitSpeed.xCmd = "" if xCmd is None else xCmd
         dat.roadLimitSpeed.xArg = "" if xArg is None else xArg
@@ -621,7 +633,7 @@ class RoadSpeedLimiter:
     self.roadLimitSpeed = None
     self.autoNaviSpeedCtrlStart = 22
     self.autoNaviSpeedCtrlEnd = 6
-    self.autoNaviSpeedBumpDist = 10
+    self.autoNaviSpeedBumpTime = 1
     self.autoNaviSpeedBumpSpeed = 30
     self.autoNaviSpeedSafetyFactor = 1.05
 
@@ -720,7 +732,7 @@ class RoadSpeedLimiter:
           safe_dist = 80
         elif cam_type == 22:
           starting_dist = v_ego * 10 #6
-          safe_dist = self.autoNaviSpeedBumpDist #v_ego * 0.5 # speed bump
+          safe_dist = self.autoNaviSpeedBumpTime * v_ego # speed bump
         else:
           safe_dist = v_ego * self.autoNaviSpeedCtrlEnd
 

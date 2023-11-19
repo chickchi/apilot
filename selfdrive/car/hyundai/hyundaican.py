@@ -7,7 +7,7 @@ from openpilot.common.numpy_fast import clip
 
 hyundai_checksum = crcmod.mkCrcFun(0x11D, initCrc=0xFD, rev=False, xorOut=0xdf)
 
-def create_lkas11(packer, frame, car_fingerprint, send_lfa_mfa, apply_steer, steer_req,
+def create_lkas11(packer, frame, car_fingerprint, apply_steer, steer_req,
                   torque_fault, lkas11, sys_warning, sys_state, enabled,
                   left_lane, right_lane,
                   left_lane_depart, right_lane_depart):
@@ -37,12 +37,13 @@ def create_lkas11(packer, frame, car_fingerprint, send_lfa_mfa, apply_steer, ste
   values["CF_Lkas_ToiFlt"] = torque_fault  # seems to allow actuation on CR_Lkas_StrToqReq
   values["CF_Lkas_MsgCount"] = frame % 0x10
 
-  if send_lfa_mfa:
-  #if car_fingerprint in (CAR.SONATA, CAR.PALISADE, CAR.KIA_NIRO_EV, CAR.KIA_NIRO_HEV_2021, CAR.SANTA_FE,
-  #                       CAR.IONIQ_EV_2020, CAR.IONIQ_PHEV, CAR.KIA_SELTOS, CAR.ELANTRA_2021, CAR.GENESIS_G70_2020,
-  #                       CAR.ELANTRA_HEV_2021, CAR.SONATA_HYBRID, CAR.KONA_EV, CAR.KONA_HEV, CAR.KONA_EV_2022,
-  #                       CAR.SANTA_FE_2022, CAR.KIA_K5_2021, CAR.IONIQ_HEV_2022, CAR.SANTA_FE_HEV_2022,
-  #                       CAR.SANTA_FE_PHEV_2022, CAR.KIA_STINGER_2022, CAR.NEXO):
+  if car_fingerprint in (CAR.SONATA, CAR.PALISADE, CAR.KIA_NIRO_EV, CAR.KIA_NIRO_HEV_2021, CAR.SANTA_FE,
+                         CAR.IONIQ_EV_2020, CAR.IONIQ_PHEV, CAR.KIA_SELTOS, CAR.ELANTRA_2021, CAR.GENESIS_G70_2020,
+                         CAR.ELANTRA_HEV_2021, CAR.SONATA_HYBRID, CAR.KONA_EV, CAR.KONA_HEV, CAR.KONA_EV_2022,
+                         CAR.SANTA_FE_2022, CAR.KIA_K5_2021, CAR.IONIQ_HEV_2022, CAR.SANTA_FE_HEV_2022,
+                         CAR.SANTA_FE_PHEV_2022, CAR.KIA_STINGER_2022, CAR.KIA_K5_HEV_2020, CAR.KIA_CEED,
+                         CAR.AZERA_6TH_GEN, CAR.AZERA_HEV_6TH_GEN, CAR.CUSTIN_1ST_GEN,
+                         CAR.NEXO):
     values["CF_Lkas_LdwsActivemode"] = int(left_lane) + (int(right_lane) << 1)
     values["CF_Lkas_LdwsOpt_USM"] = 2
 
@@ -146,7 +147,7 @@ def create_lfahda_mfc(packer, CC, blinking_signal):
   # VAL_ 1157 HDA_SysWarning 0 "no_message" 1 "driving_convenience_systems_cancelled" 2 "highway_drive_assist_system_cancelled";
   return packer.make_can_msg("LFAHDA_MFC", 0, values)
 
-def create_acc_commands_mix_scc(CP, packer, enabled, accel, upper_jerk, lower_jerk, idx, hud_control, set_speed, stopping, CC, CS, softHoldMode, speed_diff, car_fingerprint):
+def create_acc_commands_mix_scc(CP, packer, enabled, accel, upper_jerk, lower_jerk, idx, hud_control, set_speed, stopping, CC, CS, softHoldMode, cb_upper, cb_lower):
   lead_visible = hud_control.leadVisible
   cruiseGap = hud_control.cruiseGap
   softHold = hud_control.softHold
@@ -160,7 +161,7 @@ def create_acc_commands_mix_scc(CP, packer, enabled, accel, upper_jerk, lower_je
   accel = accel if longEnabled and not long_override else 0.0
   d = hud_control.objDist
   objGap = 0 if d == 0 else 2 if d < 25 else 3 if d < 40 else 4 if d < 70 else 5 
-  objGap2 = 0 if objGap == 0 else 2 if hud_control.objRelSpd < -0.1 else 1
+  objGap2 = 0 if objGap == 0 else 2 if hud_control.objRelSpd < -0.2 else 1
 
   driverOverride =  CS.out.driverOverride  #1:gas, 2:braking, 0: normal
   jerkUpperLimit = upper_jerk
@@ -176,13 +177,8 @@ def create_acc_commands_mix_scc(CP, packer, enabled, accel, upper_jerk, lower_je
       scc14_accMode = 1
       stopReq = 1
     
-    #kona_ev 데이터 보고 만들어낸 식~
-    if car_fingerprint in (CAR.KONA_EV):
-      comfortBandUpper = clip(0.9 + accel * 0.2, 0, 1.2)
-      comfortBandLower = clip(0.8 + accel * 0.2, 0, 1.2)
-    else:
-      comfortBandUpper = clip(-speed_diff, 0, 1.2)
-      comfortBandLower = clip(speed_diff, 0, 1.2)
+    comfortBandUpper = cb_upper
+    comfortBandLower = cb_lower
   else:
     scc12_accMode = 0
     scc14_accMode = 0

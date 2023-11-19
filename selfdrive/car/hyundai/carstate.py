@@ -186,7 +186,27 @@ class CarState(CarStateBase):
     else:
       gear = cp.vl["LVR12"]["CF_Lvr_Gear"]
 
-    ret.gearShifter = self.parse_gear_shifter(self.shifter_values.get(gear))
+    if not self.CP.carFingerprint in (CAR.NEXO):
+      ret.gearShifter = self.parse_gear_shifter(self.shifter_values.get(gear))
+    else:
+      gear = cp.vl["ELECT_GEAR"]["Elect_Gear_Shifter"]
+      gear_disp = cp.vl["ELECT_GEAR"]
+
+      gear_shifter = GearShifter.unknown
+
+      if gear == 1546:  # Thank you for Neokii  # fix PolorBear 22.06.05
+        gear_shifter = GearShifter.drive
+      elif gear == 2314:
+        gear_shifter = GearShifter.neutral
+      elif gear == 2569:
+        gear_shifter = GearShifter.park
+      elif gear == 2566:
+        gear_shifter = GearShifter.reverse
+
+      if gear_shifter != GearShifter.unknown and self.gear_shifter != gear_shifter:
+        self.gear_shifter = gear_shifter
+
+      ret.gearShifter = self.gear_shifter
 
     if not self.CP.openpilotLongitudinalControl:
       aeb_src = "FCA11" if self.CP.flags & HyundaiFlags.USE_FCA.value else "SCC12"
@@ -245,7 +265,7 @@ class CarState(CarStateBase):
       speedLimit = cp.vl["Navi_HU"]["SpeedLim_Nav_Clu"]
       speedLimitCam = cp.vl["Navi_HU"]["SpeedLim_Nav_Cam"]
       ret.speedLimit = speedLimit if speedLimit < 255 and speedLimitCam == 1 else 0
-      if ret.speedLimit>0:
+      if ret.speedLimit>0 and not ret.gasPressed:
         if self.speedLimitDistance <= self.totalDistance:
           self.speedLimitDistance = self.totalDistance + ret.speedLimit * 6  #일반적으로 속도*6M 시점에 안내하는것으로 보임.
         self.speedLimitDistance = max(self.totalDistance+1, self.speedLimitDistance) #구간또는 거리가 벗어난경우에는 1M를 유지함.
@@ -415,7 +435,7 @@ class CarState(CarStateBase):
       ]
       if CP.flags & HyundaiFlags.HAS_SCC13.value:
         messages += [
-          ("SCC13", 50),
+          ("SCC13", 0),
         ]
       if CP.flags & HyundaiFlags.HAS_SCC14.value:
         messages += [
