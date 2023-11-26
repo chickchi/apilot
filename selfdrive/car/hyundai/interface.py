@@ -314,16 +314,16 @@ class CarInterface(CarInterfaceBase):
     ret.pcmCruise = not ret.openpilotLongitudinalControl
 
     ret.stoppingControl = True
-    ret.startingState = True # False # startAccel을 적용하는 startingState를 막음.
-    ret.vEgoStarting = 0.4
+    ret.startingState = False  # False # startAccel을 적용하는 startingState를 막음.
+    ret.vEgoStarting = 0.3
     ret.vEgoStopping = 1.0
     ret.startAccel = 2.0
     ret.stoppingDecelRate = 1.2 # brake_travel/s while trying to stop
     ret.longitudinalActuatorDelayLowerBound = 0.5
     ret.longitudinalActuatorDelayUpperBound = 0.5
 
-    #ret.radarTimeStep = (1.0 / 50) # 50Hz   SCC11, RadarTrack은 50Hz
-    ret.radarTimeStep = (1.0 / 20) # 20Hz 레이더부하줄일겸..
+    ret.radarTimeStep = (1.0 / 50) # 50Hz   SCC11, RadarTrack은 50Hz
+    #ret.radarTimeStep = (1.0 / 20) # 20Hz 레이더부하줄일겸..
 
     # *** feature detection ***
     if candidate in CANFD_CAR:
