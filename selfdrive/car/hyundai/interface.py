@@ -314,7 +314,7 @@ class CarInterface(CarInterfaceBase):
     ret.pcmCruise = not ret.openpilotLongitudinalControl
 
     ret.stoppingControl = True
-    ret.startingState = True  # False # startAccel을 적용하는 startingState를 막음.
+    ret.startingState = False  # False # startAccel을 적용하는 startingState를 막음.
     ret.vEgoStarting = 0.3
     ret.vEgoStopping = 0.8
     ret.startAccel = 2.0
