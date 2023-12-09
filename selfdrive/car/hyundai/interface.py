@@ -316,7 +316,7 @@ class CarInterface(CarInterfaceBase):
     ret.stoppingControl = True
     ret.startingState = True  # False # startAccel을 적용하는 startingState를 막음.
     ret.vEgoStarting = 0.3
-    ret.vEgoStopping = 0.6
+    ret.vEgoStopping = 0.8
     ret.startAccel = 2.0
     ret.stoppingDecelRate = 1.2 # brake_travel/s while trying to stop
     ret.longitudinalActuatorDelayLowerBound = 0.5
