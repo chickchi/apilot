@@ -26,8 +26,8 @@ A_CRUISE_MAX_VALS = [2.0, 1.4, 0.5, 0.2, 0.15]
 A_CRUISE_MAX_BP = [0., 40 * CV.KPH_TO_MS, 70 * CV.KPH_TO_MS, 90 * CV.KPH_TO_MS, 110 * CV.KPH_TO_MS, 140 * CV.KPH_TO_MS]
 
 # Lookup table for turns
-#_A_TOTAL_MAX_V = [1.7, 3.2]
-_A_TOTAL_MAX_V = [2.5, 3.2]
+_A_TOTAL_MAX_V = [1.7, 3.2]
+#_A_TOTAL_MAX_V = [2.5, 3.2]
 _A_TOTAL_MAX_BP = [20., 40.]
 
 
