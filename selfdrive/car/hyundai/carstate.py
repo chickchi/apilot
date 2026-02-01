@@ -42,6 +42,17 @@ class CarState(CarStateBase):
 
     self.cruise_info = {}
 
+    #(add) --- SCC lead stabilization (conservative) ---
+    self.scc_lead_dist = None
+    self.scc_lead_relspd = None
+    self.scc_lead_valid = False
+
+    self.scc_ok_count = 0
+    self.scc_hold_frames = int(0.7 / DT_CTRL)   # 0.7s hold
+    self.scc_hold_timer = 0
+
+    self.scc_alpha = 0.08  # LPF alpha (0.05~0.10 conservative)
+
     # On some cars, CLU15->CF_Clu_VehicleSpeed can oscillate faster than the dash updates. Sample at 5 Hz
     self.cluster_speed = 0
     self.cluster_speed_counter = CLUSTER_SAMPLE_RATE
@@ -231,6 +242,91 @@ class CarState(CarStateBase):
     self.scc12 = cp_cruise.vl["SCC12"] if "SCC12" in cp_cruise.vl else None
     self.scc13 = cp_cruise.vl["SCC13"] if "SCC13" in cp_cruise.vl else None
     self.scc14 = cp_cruise.vl["SCC14"] if "SCC14" in cp_cruise.vl else None
+
+
+    #(add) =====================================================================
+    # SCC lead stabilization (conservative)
+    #
+    # Goal:
+    #   - prevent sudden braking when lead source switches / SCC lead spikes
+    #   - hold + gate + require persistence + smooth (LPF)
+    #
+    # Notes:
+    #   - For SCC wiring mod (sccBus == 2), SCC11 provides ObjValid/ACC_ObjDist/ACC_ObjRelSpd
+    #   - We overwrite self.scc11 lead fields so downstream (planner/fusion) sees stabilized values
+    # =====================================================================
+    if self.CP.sccBus == 2 and self.scc11 is not None:
+      # raw SCC signals (as read from DBC)
+      obj_valid = self.scc11.get("ObjValid", 0) == 1
+      raw_dist = float(self.scc11.get("ACC_ObjDist", 0.0))
+      raw_relspd = float(self.scc11.get("ACC_ObjRelSpd", 0.0))
+
+      # Initialize on first valid observation
+      if obj_valid and (self.scc_lead_dist is None):
+        self.scc_lead_dist = raw_dist
+        self.scc_lead_relspd = raw_relspd
+        self.scc_lead_valid = True
+        self.scc_ok_count = 0
+        self.scc_hold_timer = 0
+
+      # If object becomes invalid: keep previous lead for a short hold, then drop validity
+      if not obj_valid:
+        self.scc_ok_count = 0
+        if self.scc_hold_timer > 0:
+          self.scc_hold_timer -= 1
+        else:
+          self.scc_lead_valid = False
+
+      else:
+        # Conservative gating against sudden spikes vs previous stabilized values
+        v_ego = float(ret.vEgo)  # m/s
+
+        # Allow larger distance jump at higher speeds
+        # Conservative: do not accept sudden "too-close" readings
+        jump_allow = max(10.0, 0.30 * v_ego)  # meters
+        relspd_allow = 4.0                    # generous, unit/sign may vary
+
+        # Detect sudden "too-close" jump
+        jump_too_close = (self.scc_lead_dist is not None) and (raw_dist < (self.scc_lead_dist - jump_allow))
+        relspd_jump = (self.scc_lead_relspd is not None) and (abs(raw_relspd - self.scc_lead_relspd) > relspd_allow)
+
+        # Safety override: if extremely close, allow it through (conservative safety)
+        # (We avoid TTC calc here because relspd unit/sign may differ; distance-only override is safer.)
+        danger_override = raw_dist < 12.0
+
+        if (jump_too_close or relspd_jump) and not danger_override:
+          # Start/refresh hold: keep previous stable lead for 0.7s
+          self.scc_ok_count = 0
+          self.scc_hold_timer = self.scc_hold_frames
+          self.scc_lead_valid = True  # keep last known lead valid
+        else:
+          # Count consecutive OK frames
+          self.scc_ok_count += 1
+
+          # During hold, don't update (unless danger_override)
+          if self.scc_hold_timer > 0 and not danger_override:
+            self.scc_hold_timer -= 1
+          else:
+            # After N stable frames, update with LPF (smooth)
+            # Or immediately if danger_override (safety)
+            if self.scc_ok_count >= 10 or danger_override:
+              a = self.scc_alpha
+              if self.scc_lead_dist is None:
+                self.scc_lead_dist = raw_dist
+                self.scc_lead_relspd = raw_relspd
+              else:
+                self.scc_lead_dist = a * raw_dist + (1.0 - a) * self.scc_lead_dist
+                self.scc_lead_relspd = a * raw_relspd + (1.0 - a) * self.scc_lead_relspd
+              self.scc_lead_valid = True
+
+      # Overwrite SCC11 lead fields so downstream uses stabilized lead
+      if self.scc_lead_valid and (self.scc_lead_dist is not None):
+        self.scc11["ACC_ObjDist"] = float(self.scc_lead_dist)
+        self.scc11["ACC_ObjRelSpd"] = float(self.scc_lead_relspd) if (self.scc_lead_relspd is not None) else 0.0
+        self.scc11["ObjValid"] = 1
+    # =====================================================================
+    
+    
     cluSpeed = cp.vl["CLU11"]["CF_Clu_Vanz"]
     decimal = cp.vl["CLU11"]["CF_Clu_VanzDecimal"]
     if 0. < decimal < 0.5:
