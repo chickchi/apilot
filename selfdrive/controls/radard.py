@@ -3,6 +3,142 @@ import importlib
 import math
 from collections import defaultdict, deque
 
+#추가
+class LeadStabilizer:
+  """
+  Stabilize lead to reduce harsh braking on sudden cut-in / radar track ID switch.
+  Works on lead dicts: expects keys like status, dRel, vRel, yRel (others preserved).
+  """
+
+  def __init__(self, dt, hold_s=0.7, alpha=0.12, danger_dist=12.0,
+               ok_frames=6):
+    self.dt = float(dt)
+    self.hold_frames = max(1, int(hold_s / self.dt))
+    self.alpha = float(alpha)
+    self.danger_dist = float(danger_dist)
+    self.ok_frames = int(ok_frames)
+
+    self.stable = None
+    self.stable_id = None
+    self.hold = 0
+    self.ok = 0
+
+  @staticmethod
+  def _lead_id(ld: dict):
+    if not isinstance(ld, dict):
+      return None
+    # 포크별로 키 이름이 다를 수 있어 후보를 넓게 잡음
+    for k in ("trackId", "radarId", "track_id", "id"):
+      if k in ld:
+        return ld[k]
+    return None
+
+  @staticmethod
+  def _f(ld: dict, key: str, default=0.0):
+    try:
+      return float(ld.get(key, default))
+    except Exception:
+      return float(default)
+
+  def _copy(self, ld: dict):
+    # 원본 dict 유지하면서 필드만 바꿀거라 얕은복사면 충분
+    return dict(ld) if isinstance(ld, dict) else None
+
+  def update(self, raw: dict, v_ego: float) -> dict:
+    """
+    raw: lead dict from get_lead()
+    v_ego: m/s
+    returns: stabilized lead dict
+    """
+    if raw is None or not isinstance(raw, dict) or not raw.get("status", False):
+      # lead가 사라졌을 때: 잠깐 hold 후 드랍
+      if self.hold > 0 and self.stable is not None and self.stable.get("status", False):
+        self.hold -= 1
+        out = self._copy(self.stable)
+        out["status"] = True
+        return out
+
+      self.stable = None
+      self.stable_id = None
+      self.hold = 0
+      self.ok = 0
+      return raw if raw is not None else {"status": False}
+
+    # raw 값
+    rid = self._lead_id(raw)
+    d = self._f(raw, "dRel", 0.0)
+    vr = self._f(raw, "vRel", 0.0)
+    y = self._f(raw, "yRel", 0.0)
+
+    danger = d < self.danger_dist
+
+    # 첫 유효 lead면 초기화
+    if self.stable is None:
+      self.stable = self._copy(raw)
+      self.stable_id = rid
+      self.hold = 0
+      self.ok = 0
+      return raw
+
+    sd = self._f(self.stable, "dRel", d)
+    svr = self._f(self.stable, "vRel", vr)
+
+    # -------------------------
+    # 게이팅(튀는 값 판단)
+    # -------------------------
+    # “너무 가까워지는 점프”만 강하게 막는 게 급브레이크 완화에 효과적
+    # 프레임당 허용 거리 감소량(대략):
+    #  - 기본 6m + 속도/상대속도 고려해서 조금 가변
+    closing = max(0.0, -(vr))  # vr이 음수면 접근 중
+    jump_allow = max(6.0, (v_ego * 0.15) + (closing * self.dt * 6.0))  # meters
+
+    too_close_jump = d < (sd - jump_allow)
+
+    # ID 스위치 힌트(있을 때만)
+    id_switch = (rid is not None and self.stable_id is not None and rid != self.stable_id)
+
+    # vRel 급변도 감시(단, 단위/노이즈가 있을 수 있어 속도에 비례하게)
+    relspd_allow = max(4.0, 0.25 * v_ego)   # m/s-ish
+    relspd_jump = abs(vr - svr) > relspd_allow
+
+    spike = (too_close_jump or relspd_jump) and not danger
+
+    if spike:
+      # hold 시작/갱신
+      self.hold = self.hold_frames
+      self.ok = 0
+      out = self._copy(self.stable)
+      out["status"] = True
+      return out
+
+    # 스파이크가 아니면 정상 카운트
+    self.ok += 1
+    if self.hold > 0 and not danger:
+      # hold 중이면 stable 유지(단 danger면 즉시 반영)
+      self.hold -= 1
+      out = self._copy(self.stable)
+      out["status"] = True
+      return out
+
+    # -------------------------
+    # LPF 업데이트
+    # -------------------------
+    # ok_frames만큼 연속으로 정상일 때 부드럽게 갱신
+    if self.ok >= self.ok_frames or danger or id_switch:
+      a = self.alpha if not danger else max(self.alpha, 0.35)  # 위험이면 더 빨리 반영
+      new = self._copy(raw)
+      new["dRel"] = a * d + (1.0 - a) * sd
+      new["vRel"] = a * vr + (1.0 - a) * svr
+      new["yRel"] = a * y + (1.0 - a) * self._f(self.stable, "yRel", y)
+      new["status"] = True
+
+      self.stable = new
+      self.stable_id = rid
+      return new
+
+    # 아직 충분히 안정 프레임이 쌓이기 전이면 raw 그대로
+    return raw
+
 import cereal.messaging as messaging
 from cereal import car
 from common.numpy_fast import interp
@@ -98,24 +234,34 @@ def get_path_adjacent_leads(v_ego, md, lane_width, clusters):
       c_y = None
   else:
     c_y = None
-  
-  if md is not None or len(md.position.x) == TRAJECTORY_SIZE or md.position.x[-1] > LEAD_PATH_DREL_MIN:
-    md_y = md.position.y
-    md_x = md.position.x
+    ll_x = None   #add
+    
+  pos_x = md.position.x if md is not None else []
+  pos_y = md.position.y if md is not None else []
+  if md is not None and len(pos_x) > 0 and len(pos_y) > 0 and (len(pos_x) == TRAJECTORY_SIZE or pos_x[-1] > LEAD_PATH_DREL_MIN):   
+  #if md is not None and (len(md.position.x) == TRAJECTORY_SIZE or md.position.x[-1] > LEAD_PATH_DREL_MIN):
+    md_y = pos_y
+    md_x = pos_x
   else:
     md_y = None
-  
+    md_x = None   #add
+    
   leads_left = {}
   leads_center = {}
   leads_right = {}
   half_lane_width = lane_width / 2
   for c in clusters:
-    if md_y is not None and c.dRel <= md_x[-1] or (c_y is not None and md_x[-1] - c.dRel < ll_x[-1] - c.dRel):
+    use_model_path = (md_x is not None and md_y is not None and len(md_x) > 0 and len(md_y) > 0)
+    use_lane_path  = (c_y is not None and ll_x is not None and len(ll_x) > 0 and len(c_y) > 0)
+    
+    if use_model_path and (c.dRel <= md_x[-1] or (use_lane_path and md_x[-1] < ll_x[-1])):
       dPath = -c.yRel - interp(c.dRel, md_x, md_y)
       checkSource = 'modelPath'
-    elif c_y is not None:
+      
+    elif use_lane_path:
       dPath = -c.yRel - interp(c.dRel, ll_x, c_y.tolist())
       checkSource = 'modelLaneLines'
+      
     else:
       dPath = -c.yRel
       checkSource = 'lowSpeedOverride'
@@ -168,7 +314,12 @@ class RadarD():
 
     self.tracks = defaultdict(dict)
     self.kalman_params = KalmanParams(radar_ts)
+    
+    # (add) lead stabilization to reduce harsh braking on cut-in / id switch
+    self.lead_stab_one = LeadStabilizer(radar_ts, hold_s=0.7, alpha=0.12, danger_dist=12.0, ok_frames=6)
+    self.lead_stab_two = LeadStabilizer(radar_ts, hold_s=0.5, alpha=0.12, danger_dist=12.0, ok_frames=6)
 
+    
     # v_ego
     self.v_ego = 0.
     self.v_ego_hist = deque([0], maxlen=delay+1)
@@ -207,7 +358,7 @@ class RadarD():
 
       # create the track if it doesn't exist or it's a new track
       if ids not in self.tracks:
-        self.tracks[ids] = Track(v_lead, self.kalman_params)
+        self.tracks[ids] = Track(v_lead, self.kalman_params, track_id=ids)
       self.tracks[ids].update(rpt[0], rpt[1], rpt[2], v_lead, rpt[3])
 
     idens = list(sorted(self.tracks.keys()))
@@ -252,9 +403,21 @@ class RadarD():
       model_v_ego = self.v_ego
     leads_v3 = sm['modelV2'].leadsV3
     if len(leads_v3) > 1:
-      radarState.leadOne = get_lead(self.v_ego, self.ready, clusters, leads_v3[0], model_v_ego, low_speed_override=True, mixRadarInfo=self.mixRadarInfo)
-      radarState.leadTwo = get_lead(self.v_ego, self.ready, clusters, leads_v3[1], model_v_ego, low_speed_override=False, mixRadarInfo=self.mixRadarInfo)
+      lead1 = get_lead(self.v_ego, self.ready, clusters, leads_v3[0], model_v_ego, low_speed_override=True, mixRadarInfo=self.mixRadarInfo)
+      lead2 = get_lead(self.v_ego, self.ready, clusters, leads_v3[1], model_v_ego, low_speed_override=False, mixRadarInfo=self.mixRadarInfo)
+      
+      # (add) stabilize leads (cut-in / id switch harsh brake mitigation)
+      lead1 = self.lead_stab_one.update(lead1, self.v_ego)
+      lead2 = self.lead_stab_two.update(lead2, self.v_ego)
 
+      # schema에 trackId 없을 수 있으니 publish 전 제거 (안전)
+      lead1.pop("trackId", None)
+      lead2.pop("trackId", None)
+      
+      radarState.leadOne = lead1
+      radarState.leadTwo = lead2
+      #추가 끝
+      
       if self.ready and self.showRadarInfo: #self.extended_radar_enabled and self.ready:
         ll,lc,lr = get_path_adjacent_leads(self.v_ego, sm['modelV2'], sm['lateralPlan'].laneWidth, clusters)
         #try:
@@ -266,6 +429,11 @@ class RadarD():
         #except AttributeError:
         #  lc = []
         #  self.lead_one_plus_lr.reset()
+        for group in (ll, lc, lr):  #add
+          for ld in group:   
+            if isinstance(ld, dict):
+              ld.pop("trackId", None)
+        
         radarState.leadsLeft = list(ll)
         radarState.leadsCenter = list(lc)
         radarState.leadsRight = list(lr)
