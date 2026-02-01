@@ -238,22 +238,28 @@ class CarState(CarStateBase):
     #self.scc12 = copy.copy(cp_cruise.vl["SCC12"])
     #self.scc13 = copy.copy(cp_cruise.vl["SCC13"]) if "SCC13" in cp_cruise.vl else None
     #self.scc14 = copy.copy(cp_cruise.vl["SCC14"])
-    self.scc11 = cp_cruise.vl["SCC11"] if "SCC11" in cp_cruise.vl else None
+    # --- SCC message snapshots (make SCC11 writable by copying) ---
+    self.scc11_raw = cp_cruise.vl["SCC11"] if "SCC11" in cp_cruise.vl else None
     self.scc12 = cp_cruise.vl["SCC12"] if "SCC12" in cp_cruise.vl else None
     self.scc13 = cp_cruise.vl["SCC13"] if "SCC13" in cp_cruise.vl else None
     self.scc14 = cp_cruise.vl["SCC14"] if "SCC14" in cp_cruise.vl else None
 
+    # Make SCC11 writable (some cp.vl views are read-only)
+    self.scc11 = copy.copy(self.scc11_raw) if self.scc11_raw is not None else None
 
-    #(add) =====================================================================
+    # =====================================================================
     # SCC lead stabilization (conservative)
     #
     # Goal:
     #   - prevent sudden braking when lead source switches / SCC lead spikes
     #   - hold + gate + require persistence + smooth (LPF)
     #
-    # Notes:
-    #   - For SCC wiring mod (sccBus == 2), SCC11 provides ObjValid/ACC_ObjDist/ACC_ObjRelSpd
-    #   - We overwrite self.scc11 lead fields so downstream (planner/fusion) sees stabilized values
+    # Applies to:
+    #   - wiring SCC (sccBus == 2), using SCC11: ObjValid/ACC_ObjDist/ACC_ObjRelSpd
+    #
+    # Output:
+    #   - overwrite self.scc11["ACC_ObjDist"/"ACC_ObjRelSpd"/"ObjValid"]
+    #     so downstream sees stabilized SCC lead values
     # =====================================================================
     if self.CP.sccBus == 2 and self.scc11 is not None:
       # raw SCC signals (as read from DBC)
@@ -281,8 +287,7 @@ class CarState(CarStateBase):
         # Conservative gating against sudden spikes vs previous stabilized values
         v_ego = float(ret.vEgo)  # m/s
 
-        # Allow larger distance jump at higher speeds
-        # Conservative: do not accept sudden "too-close" readings
+        # Allow larger distance jump at higher speeds (very conservative)
         jump_allow = max(10.0, 0.30 * v_ego)  # meters
         relspd_allow = 4.0                    # generous, unit/sign may vary
 
@@ -291,7 +296,7 @@ class CarState(CarStateBase):
         relspd_jump = (self.scc_lead_relspd is not None) and (abs(raw_relspd - self.scc_lead_relspd) > relspd_allow)
 
         # Safety override: if extremely close, allow it through (conservative safety)
-        # (We avoid TTC calc here because relspd unit/sign may differ; distance-only override is safer.)
+        # (Avoid TTC calc here because relspd unit/sign may differ; distance-only override is safer.)
         danger_override = raw_dist < 12.0
 
         if (jump_too_close or relspd_jump) and not danger_override:
