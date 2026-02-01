@@ -43,6 +43,7 @@ class CarState(CarStateBase):
     self.cruise_info = {}
 
     #(add) --- SCC lead stabilization (conservative) ---
+    self.scc11_raw = None 
     self.scc_lead_dist = None
     self.scc_lead_relspd = None
     self.scc_lead_valid = False
