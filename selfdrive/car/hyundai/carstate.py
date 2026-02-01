@@ -33,7 +33,7 @@ class CarState(CarStateBase):
       self.shifter_values = can_define.dv["LVR12"]["CF_Lvr_Gear"]
 
     self.is_metric = False
-     #ajouatom
+    #ajouatom
     self.prev_pcmMode = False
     self.mdps_error_cnt = 0
 
