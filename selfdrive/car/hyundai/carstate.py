@@ -245,7 +245,7 @@ class CarState(CarStateBase):
     self.scc14 = cp_cruise.vl["SCC14"] if "SCC14" in cp_cruise.vl else None
 
     # Make SCC11 writable (some cp.vl views are read-only)
-    self.scc11 = copy.copy(self.scc11_raw) if self.scc11_raw is not None else None
+    self.scc11 = dict(self.scc11_raw) if self.scc11_raw is not None else None
 
     # =====================================================================
     # SCC lead stabilization (conservative)
@@ -289,7 +289,7 @@ class CarState(CarStateBase):
 
         # Allow larger distance jump at higher speeds (very conservative)
         jump_allow = max(10.0, 0.30 * v_ego)  # meters
-        relspd_allow = 4.0                    # generous, unit/sign may vary
+        relspd_allow = max(6.0, 0.3 * v_ego)        # unit-agnostic, conservative
 
         # Detect sudden "too-close" jump
         jump_too_close = (self.scc_lead_dist is not None) and (raw_dist < (self.scc_lead_dist - jump_allow))
