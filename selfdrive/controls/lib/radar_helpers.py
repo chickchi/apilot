@@ -16,7 +16,8 @@ RADAR_TO_CENTER = 2.7   # (deprecated) RADAR is ~ 2.7m ahead from center of car
 RADAR_TO_CAMERA = 1.52   # RADAR is ~ 1.5m ahead from center of mesh frame
 
 class Track():
-  def __init__(self, v_lead, kalman_params):
+  def __init__(self, v_lead, kalman_params, track_id=None):
+    self.trackId = track_id
     self.cnt = 0
     self.aLeadTau = _LEAD_ACCEL_TAU
     self.K_A = kalman_params.A
@@ -24,6 +25,7 @@ class Track():
     self.K_K = kalman_params.K
     self.kf = KF1D([[v_lead], [0.0]], self.K_A, self.K_C, self.K_K)
     self.dRel = 0.0
+    self.aRel = 0.0
 
   def update(self, d_rel, y_rel, v_rel, v_lead, measured):
     #apilot: changed radar target
@@ -51,6 +53,9 @@ class Track():
     else:
       self.aLeadTau *= 0.9
 
+    # (add) define aRel always (recommended option #2)
+    self.aRel = self.aLeadK
+    
     self.cnt += 1
 
   def get_key_for_cluster(self):
@@ -61,7 +66,8 @@ class Track():
     self.kf = KF1D([[self.vLead], [aLeadK]], self.K_A, self.K_C, self.K_K)
     self.aLeadK = aLeadK
     self.aLeadTau = aLeadTau
-
+    self.aRel = aLeadK   #add
+    self.cnt = 0   #add
 
 class Cluster():
   def __init__(self):
@@ -72,52 +78,66 @@ class Cluster():
     # add the first track
     self.tracks.add(t)
 
+  # 대표 track: 가장 가까운 트랙
+  @property
+  def trackId(self):
+    if not self.tracks:
+      return None
+    t = min(self.tracks, key=lambda x: x.dRel)
+    return getattr(t, "trackId", None)
+  
   # TODO: make generic
   @property
   def dRel(self):
-    return mean([t.dRel for t in self.tracks])
+    return mean([t.dRel for t in self.tracks]) if self.tracks else 0.0
 
   @property
   def yRel(self):
-    return mean([t.yRel for t in self.tracks])
+    return mean([t.yRel for t in self.tracks]) if self.tracks else 0.0
 
   @property
   def vRel(self):
-    return mean([t.vRel for t in self.tracks])
+    return mean([t.vRel for t in self.tracks]) if self.tracks else 0.0
 
   @property
   def aRel(self):
-    return mean([t.aRel for t in self.tracks])
+    return mean([t.aRel for t in self.tracks]) if self.tracks else 0.0
+    #return mean([t.aRel for t in self.tracks])
 
   @property
   def vLead(self):
-    return mean([t.vLead for t in self.tracks])
+    return mean([t.vLead for t in self.tracks]) if self.tracks else 0.0
 
   @property
   def dPath(self):
-    return mean([t.dPath for t in self.tracks])
+    vals = [t.dPath for t in self.tracks if hasattr(t, "dPath")]
+    return mean(vals) if len(vals) else 0.0
+    #return mean([t.dPath for t in self.tracks])
 
   @property
   def vLat(self):
-    return mean([t.vLat for t in self.tracks])
+    vals = [t.vLat for t in self.tracks if hasattr(t, "vLat")]
+    return mean(vals) if len(vals) else 0.0
+    #return mean([t.vLat for t in self.tracks])
 
   @property
   def vLeadK(self):
-    return mean([t.vLeadK for t in self.tracks])
+    return mean([t.vLeadK for t in self.tracks]) if self.tracks else 0.0
 
   @property
   def aLeadK(self):
-    if all(t.cnt <= 1 for t in self.tracks):
-      return 0.
-    else:
-      return mean([t.aLeadK for t in self.tracks if t.cnt > 1])
+    if not self.tracks:
+      return 0.0
+    vals = [t.aLeadK for t in self.tracks if t.cnt > 1]
+    return mean(vals) if len(vals) else 0.0
+
 
   @property
   def aLeadTau(self):
-    if all(t.cnt <= 1 for t in self.tracks):
+    if not self.tracks:
       return _LEAD_ACCEL_TAU
-    else:
-      return mean([t.aLeadTau for t in self.tracks if t.cnt > 1])
+    vals = [t.aLeadTau for t in self.tracks if t.cnt > 1]
+    return mean(vals) if len(vals) else _LEAD_ACCEL_TAU
 
   @property
   def measured(self):
@@ -125,6 +145,7 @@ class Cluster():
 
   def get_RadarState(self, model_prob=0.0):
     return {
+      "trackId": self.trackId,   # (add)
       "dRel": float(self.dRel),
       "yRel": float(self.yRel),
       "vRel": float(self.vRel),
@@ -145,6 +166,7 @@ class Cluster():
 
     aLeadK = self.aLeadKFilter.process(float(lead_msg.a[0]) if useVisionMix else float(self.aLeadK))
     return {
+      "trackId": self.trackId,   # (add)
       "dRel": float(self.dRel),
       "yRel": float(self.yRel) if mixRadarInfo == 0 or self.yRel != 0 else float(-lead_msg.y[0]),
       "vRel": float(self.vRel),
@@ -161,6 +183,7 @@ class Cluster():
   def get_RadarState_from_vision(self, lead_msg, v_ego, model_v_ego):
     lead_v_rel_pred = lead_msg.v[0] - model_v_ego
     return {
+      "trackId": None,  # (add) vision fallback
       "dRel": float(lead_msg.x[0] - RADAR_TO_CAMERA),
       "yRel": float(-lead_msg.y[0]),
       "vRel": float(lead_v_rel_pred),
