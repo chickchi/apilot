@@ -407,8 +407,8 @@ class RadarD():
       lead2 = get_lead(self.v_ego, self.ready, clusters, leads_v3[1], model_v_ego, low_speed_override=False, mixRadarInfo=self.mixRadarInfo)
       
       # (add) stabilize leads (cut-in / id switch harsh brake mitigation)
-      lead1 = self.lead_stab_one.update(lead1, self.v_ego)
-      lead2 = self.lead_stab_two.update(lead2, self.v_ego)
+      #lead1 = self.lead_stab_one.update(lead1, self.v_ego)
+      #lead2 = self.lead_stab_two.update(lead2, self.v_ego)
 
       # schema에 trackId 없을 수 있으니 publish 전 제거 (안전)
       lead1.pop("trackId", None)
