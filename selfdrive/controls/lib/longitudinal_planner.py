@@ -17,18 +17,11 @@ from common.params import Params
 
 LON_MPC_STEP = 0.2  # first step is 0.2s
 A_CRUISE_MIN = -1.2
-#A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
-#A_CRUISE_MAX_VALS = [2.0, 1.2, 0.8, 0.6]
-##A_CRUISE_MAX_VALS = [2.0, 1.4, 0.5, 0.2, 0.15]
-#A_CRUISE_MAX_BP = [0., 40 * CV.KPH_TO_MS, 60 * CV.KPH_TO_MS, 80 * CV.KPH_TO_MS, 110 * CV.KPH_TO_MS, 140 * CV.KPH_TO_MS]
-##A_CRUISE_MAX_BP = [0., 40 * CV.KPH_TO_MS, 60 * CV.KPH_TO_MS, 80 * CV.KPH_TO_MS, 100 * CV.KPH_TO_MS, 140 * CV.KPH_TO_MS]
-A_CRUISE_MAX_VALS = [2.5, 2.0, 1.5, 1.0, 0.8]
-A_CRUISE_MAX_BP = [0., 20 * CV.KPH_TO_MS, 40 * CV.KPH_TO_MS, 60 * CV.KPH_TO_MS, 80 * CV.KPH_TO_MS]
+
+A_CRUISE_MAX_VALS = [1.6, 1.4, 1.2, 0.9, 0.8]
+A_CRUISE_MAX_BP = [0., 20*CV.KPH_TO_MS, 40*CV.KPH_TO_MS, 60*CV.KPH_TO_MS, 80*CV.KPH_TO_MS]
 
 # Lookup table for turns
-#_A_TOTAL_MAX_V = [1.7, 3.2]
-#_A_TOTAL_MAX_V = [2.5, 3.2]
-#_A_TOTAL_MAX_V = [2.0, 3.2]
 _A_TOTAL_MAX_V = [2.0, 3.2]
 _A_TOTAL_MAX_BP = [20., 40.]
 
@@ -159,27 +152,54 @@ class LongitudinalPlanner:
     prev_accel_constraint = not (reset_state or sm['carState'].standstill)
 
     if self.mpc.mode == 'acc':
-      #accel_limits = [A_CRUISE_MIN, get_max_accel(v_ego)]      
-      if myDrivingMode in [1]: # 연비
-        myMaxAccel = clip(self.get_max_accel(v_ego)*self.myEcoModeFactor, 0, MAX_ACCEL)
-      elif myDrivingMode in [2]: # 안전
-        myMaxAccel = clip(self.get_max_accel(v_ego)*self.myEcoModeFactor*mySafeModeFactor, 0, MAX_ACCEL)
-      elif myDrivingMode in [3,4]: # 일반, 고속
+      # 1) 먼저 기본 myMaxAccel 계산
+      if myDrivingMode in [1]:  # 연비
+        myMaxAccel = clip(self.get_max_accel(v_ego) * self.myEcoModeFactor, 0, MAX_ACCEL)
+      elif myDrivingMode in [2]:  # 안전
+        myMaxAccel = clip(self.get_max_accel(v_ego) * self.myEcoModeFactor * mySafeModeFactor, 0, MAX_ACCEL)
+      elif myDrivingMode in [3, 4]:  # 일반, 고속
         myMaxAccel = clip(self.get_max_accel(v_ego), 0, MAX_ACCEL)
       else:
         myMaxAccel = self.get_max_accel(v_ego)
+
       accel_limits = [A_CRUISE_MIN, myMaxAccel]
-      accel_limits_turns = limit_accel_in_turns(v_ego, sm['carState'].steeringAngleDeg, accel_limits, self.CP)
+    
     else:
-      accel_limits = [MIN_ACCEL, MAX_ACCEL]
-      accel_limits_turns = [MIN_ACCEL, MAX_ACCEL]
+      # blended 등: 감속 여유는 열어두고(안전), 기본 상한은 MAX_ACCEL
+      # accel_limits = [MIN_ACCEL, MAX_ACCEL]
+      accel_limits = [A_CRUISE_MIN, MAX_ACCEL]
+
+    # lead는 여기서 딱 1번만 읽기
+    lead = sm['radarState'].leadOne
+
+    # 1-추가) 위험 접근이면 감속 하한만 MIN_ACCEL로 "오픈" (모드 무관)
+    if lead.status and (lead.dRel < 8.0 or (v_ego < 10.0 and lead.vRel < -3.0)):
+      accel_limits[0] = MIN_ACCEL
+    
+    # 2) (add) lead가 가까울 때만 accel_limits[1] 추가로 낮춤
+    if lead.status:
+      d = float(lead.dRel)
+      vr = float(lead.vRel)  # lead - ego (negative => closing)
+
+      # 가까울수록 가속을 거의 막고, 25m까지 완만히 풀림
+      close_cap = interp(d, [6.0, 12.0, 20.0, 30.0], [0.10, 0.30, 0.70, accel_limits[1]])
+
+      # 접근(closing)이면 더 보수적으로
+      if vr < -1.0:
+        close_cap = min(close_cap, interp(v_ego, [0.0, 6.0, 15.0], [0.15, 0.25, 0.40]))
+
+      accel_limits[1] = min(accel_limits[1], close_cap)
+
+    # 3) turns 제한은 마지막에 한 번
+    accel_limits_turns = limit_accel_in_turns(v_ego, sm['carState'].steeringAngleDeg, accel_limits, self.CP)
+
 
     if reset_state:
       self.v_desired_filter.x = v_ego
       # Clip aEgo to cruise limits to prevent large accelerations when becoming active
       self.a_desired = clip(sm['carState'].aEgo, accel_limits[0], accel_limits[1])
       self.mpc.prev_a = np.full(N+1, self.a_desired) ## mpc에서는 prev_a를 참고하여 constraint작동함.... pid off -> on시에는 현재 constraint가 작동하지 않아서 집어넣어봄...
-      accel_limits_turns[0] = accel_limits_turns[0] = 0.0
+      accel_limits_turns[0] = 0.0
 
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
@@ -214,6 +234,23 @@ class LongitudinalPlanner:
     a_prev = self.a_desired
     self.a_desired = float(interp(DT_MDL, T_IDXS[:CONTROL_N], self.a_desired_trajectory))
     self.v_desired_filter.x = self.v_desired_filter.x + DT_MDL * (self.a_desired + a_prev) / 2.0
+
+    # --- (add) lead present: limit how fast we increase acceleration (positive jerk limiting)
+    if lead.status:
+      j_pos_limit = interp(v_ego, [0.0, 3.0, 8.0, 20.0], [0.25, 0.35, 0.55, 0.90])
+      a_inc_max = j_pos_limit * DT_MDL
+
+      # +가속(증가) 제한
+      if self.a_desired > a_prev:
+        self.a_desired = min(self.a_desired, a_prev + a_inc_max)
+      
+      # -감속(감소)도 저속에서만 부드럽게 제한 (정체 구간 타겟)
+      if v_ego < 10.0 and lead.dRel < 30.0 and not (lead.dRel < 8.0 or lead.vRel < -3.0):
+        j_neg_limit = interp(v_ego, [0.0, 3.0, 8.0, 10.0], [0.35, 0.50, 0.80, 1.20])
+        a_dec_max = j_neg_limit * DT_MDL
+        if self.a_desired < a_prev:
+          self.a_desired = max(self.a_desired, a_prev - a_dec_max)
+
 
   def publish(self, sm, pm):
     plan_send = messaging.new_message('longitudinalPlan')
