@@ -182,8 +182,19 @@ class LongitudinalPlanner:
       vr = float(lead.vRel)  # lead - ego (negative => closing)
 
       # 가까울수록 가속을 거의 막고, 25m까지 완만히 풀림
-      close_cap = interp(d, [6.0, 12.0, 20.0, 30.0], [0.10, 0.30, 0.70, accel_limits[1]])
+      close_cap = interp(d, [6.0, 12.0, 20.0, 30.0], [0.10, 0.30, 0.75, accel_limits[1]])
+      #12m: 0.30 → 너무 답답하지 않게 “살짝” 가속 허용
+      #20m: 0.75 → gap이 어느 정도면 자연스럽게 따라가기 시작
+      #6m는 그대로 0.10이라 가까울 때 급가속은 계속 막힘
+      #더 부드럽게(보수적으로) 가고 싶으면 12m를 0.25로, 더 반응성을 원하면 0.35~0.40까지.
 
+      # 정체 재출발 보정: 저속 + gap 작고 + 앞차가 멀어지는 중이면 cap을 조금 빨리 풀어줌
+      if v_ego < 10.0 and d < 25.0 and vr > 0.3:
+        # 최소 허용 가속(답답함 방지)
+        close_cap = max(close_cap, 0.50) #default 0.60
+        # 급출발 방지용 상한(차량 취향에 맞게 1.0~1.4 범위 튜닝)
+        close_cap = min(close_cap, 1.05) #default 1.20
+      
       # 접근(closing)이면 더 보수적으로
       if vr < -1.0:
         close_cap = min(close_cap, interp(v_ego, [0.0, 6.0, 15.0], [0.15, 0.25, 0.40]))
@@ -237,9 +248,20 @@ class LongitudinalPlanner:
 
     # --- (add) lead present: limit how fast we increase acceleration (positive jerk limiting)
     if lead.status:
+
+      restart_boost = (v_ego < 10.0 and lead.dRel < 25.0 and lead.vRel > 0.35)
+      
       j_pos_limit = interp(v_ego, [0.0, 3.0, 8.0, 20.0], [0.25, 0.35, 0.55, 0.90])
+
+      # 정체 재출발(앞차가 멀어짐)일 때만 +jerk 제한을 완화해서 더 빨리 따라가게
+      if restart_boost:
+        j_pos_limit *= 1.3   # 1.25~1.6 사이 취향 튜닝
+      
       a_inc_max = j_pos_limit * DT_MDL
 
+      if restart_boost:
+        a_inc_max = min(a_inc_max, 0.06)   # 0.05~0.08 범위 취향
+      
       # +가속(증가) 제한
       if self.a_desired > a_prev:
         self.a_desired = min(self.a_desired, a_prev + a_inc_max)
