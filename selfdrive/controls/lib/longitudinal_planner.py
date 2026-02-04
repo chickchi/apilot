@@ -76,7 +76,11 @@ class LongitudinalPlanner:
     self.autoTurnControl = int(Params().get("AutoTurnControl", encoding="utf8"))
 
     self.mpc.openpilotLongitudinalControl = CP.openpilotLongitudinalControl
-
+    
+    self.prev_lead_d = 0.0
+    self.depart_cnt = 0
+    self.lead_dep_score = 0
+  
   def read_param(self):
     #try:
     #  self.personality = int(self.params.get('LongitudinalPersonality'))
@@ -172,6 +176,30 @@ class LongitudinalPlanner:
     # lead는 여기서 딱 1번만 읽기
     lead = sm['radarState'].leadOne
 
+    if lead.status:
+      d = float(lead.dRel)
+      
+      # d_rate 첫 프레임 튐 방지 (prev_lead_d가 초기값이면 0으로)
+      if self.prev_lead_d > 0.1:
+        d_rate = d - self.prev_lead_d
+      else:
+        d_rate = 0.0
+      self.prev_lead_d = d
+
+      lead_departing = (v_ego < 3.0) and (d < 35.0) and ((lead.vRel > 0.05) or (d_rate > 0.03))
+      
+      if self.lead_dep_score >= 2:
+        self.depart_cnt = int(1.8 / DT_MDL)   # 1.5초 부스트 윈도우
+
+    else:
+      self.prev_lead_d = 0.0
+      self.depart_cnt = 0
+      
+    # 여기서 “딱 1번만” 감소 (블록 밖)
+    if self.depart_cnt > 0:
+    self.depart_cnt -= 1
+    
+    
     # 1-추가) 위험 접근이면 감속 하한만 MIN_ACCEL로 "오픈" (모드 무관)
     if lead.status and (lead.dRel < 8.0 or (v_ego < 10.0 and lead.vRel < -3.0)):
       accel_limits[0] = MIN_ACCEL
@@ -198,6 +226,10 @@ class LongitudinalPlanner:
       # 접근(closing)이면 더 보수적으로
       if vr < -1.0:
         close_cap = min(close_cap, interp(v_ego, [0.0, 6.0, 15.0], [0.15, 0.25, 0.40]))
+        
+      # depart 부스트 구간에는 close_cap을 조금 완화 (초반 반응성)
+      if self.depart_cnt > 0 and v_ego < 10.0 and d < 35.0:
+        close_cap = max(close_cap, 1.05)   # 0.8~1.1 취향
 
       accel_limits[1] = min(accel_limits[1], close_cap)
 
@@ -249,7 +281,7 @@ class LongitudinalPlanner:
     # --- (add) lead present: limit how fast we increase acceleration (positive jerk limiting)
     if lead.status:
 
-      restart_boost = (v_ego < 10.0 and lead.dRel < 25.0 and lead.vRel > 0.35)
+      restart_boost = (self.depart_cnt > 0) and (v_ego < 10.0)
       
       j_pos_limit = interp(v_ego, [0.0, 3.0, 8.0, 20.0], [0.25, 0.35, 0.55, 0.90])
 
@@ -260,7 +292,7 @@ class LongitudinalPlanner:
       a_inc_max = j_pos_limit * DT_MDL
 
       if restart_boost:
-        a_inc_max = min(a_inc_max, 0.06)   # 0.05~0.08 범위 취향
+        a_inc_max = max(a_inc_max, 0.12)   # 0.05~0.08 범위 취향
       
       # +가속(증가) 제한
       if self.a_desired > a_prev:
@@ -296,7 +328,12 @@ class LongitudinalPlanner:
     longitudinalPlan.debugLongText1 = self.mpc.debugLongText1
     #self.mpc.debugLongText2 = "Vout={:3.2f},{:3.2f},{:3.2f},{:3.2f},{:3.2f}".format(longitudinalPlan.speeds[0]*3.6,longitudinalPlan.speeds[1]*3.6,longitudinalPlan.speeds[2]*3.6,longitudinalPlan.speeds[3]*3.6,longitudinalPlan.speeds[-1]*3.6)
     #self.mpc.debugLongText2 = "VisionTurn:State={},Speed={:.1f}".format(self.vision_turn_controller.state, self.vision_turn_controller.v_turn*3.6)
-    longitudinalPlan.debugLongText2 = self.mpc.debugLongText2
+    #longitudinalPlan.debugLongText2 = self.mpc.debugLongText2
+    lead = sm['radarState'].leadOne
+    longitudinalPlan.debugLongText2 = (
+      f"{self.mpc.debugLongText2} | dep={self.depart_cnt} "
+      f"d={lead.dRel:.1f} vr={lead.vRel:.2f} v={sm['carState'].vEgo*3.6:.1f}"
+    ) if lead.status else f"{self.mpc.debugLongText2} | dep={self.depart_cnt} lead=0"
     longitudinalPlan.trafficState = self.mpc.trafficState
     longitudinalPlan.xState = self.mpc.xState
     if self.mpc.trafficError:
