@@ -192,7 +192,7 @@ class LongitudinalPlanner:
       if lead_departing:
         self.lead_dep_score = min(self.lead_dep_score + 1, 5)
       else:
-        self.lead_dep_score = 0
+        self.lead_dep_score = max(self.lead_dep_score - 1, 0)
       
       if self.lead_dep_score >= 2:
         self.depart_cnt = int(1.8 / DT_MDL)   # 1.5초 부스트 윈도우
