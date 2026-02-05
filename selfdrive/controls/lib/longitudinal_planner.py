@@ -78,7 +78,7 @@ class LongitudinalPlanner:
     self.mpc.openpilotLongitudinalControl = CP.openpilotLongitudinalControl
     
     self.prev_lead_d = 0.0
-    self.depart_cnt = 0
+    self.depart_cnt = 0  
     self.lead_dep_score = 0
   
   def read_param(self):
@@ -187,6 +187,12 @@ class LongitudinalPlanner:
       self.prev_lead_d = d
 
       lead_departing = (v_ego < 3.0) and (d < 35.0) and ((lead.vRel > 0.05) or (d_rate > 0.03))
+
+      # ✅ score 누적/감쇠 (핵심)
+      if lead_departing:
+        self.lead_dep_score = min(self.lead_dep_score + 1, 5)
+      else:
+        self.lead_dep_score = 0
       
       if self.lead_dep_score >= 2:
         self.depart_cnt = int(1.8 / DT_MDL)   # 1.5초 부스트 윈도우
@@ -194,10 +200,11 @@ class LongitudinalPlanner:
     else:
       self.prev_lead_d = 0.0
       self.depart_cnt = 0
+      self.lead_dep_score = 0
       
     # 여기서 “딱 1번만” 감소 (블록 밖)
     if self.depart_cnt > 0:
-    self.depart_cnt -= 1
+      self.depart_cnt -= 1
     
     
     # 1-추가) 위험 접근이면 감속 하한만 MIN_ACCEL로 "오픈" (모드 무관)
