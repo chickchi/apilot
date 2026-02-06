@@ -80,7 +80,10 @@ class LongitudinalPlanner:
     self.prev_lead_d = 0.0
     self.depart_cnt = 0  
     self.lead_dep_score = 0
-  
+    self.ld_dbg = 0
+    self.drate_dbg = 0.0
+    self.cap_dbg = 0.0
+
   def read_param(self):
     #try:
     #  self.personality = int(self.params.get('LongitudinalPersonality'))
@@ -176,6 +179,9 @@ class LongitudinalPlanner:
     # lead는 여기서 딱 1번만 읽기
     lead = sm['radarState'].leadOne
 
+    lead_departing = False
+    d_rate = 0.0
+    
     if lead.status:
       d = float(lead.dRel)
       
@@ -187,7 +193,9 @@ class LongitudinalPlanner:
       self.prev_lead_d = d
 
       lead_departing = (v_ego < 3.0) and (d < 35.0) and ((lead.vRel > 0.05) or (d_rate > 0.03))
-
+      self.ld_dbg = int(lead_departing)
+      self.drate_dbg = float(d_rate)
+      
       # ✅ score 누적/감쇠 (핵심)
       if lead_departing:
         self.lead_dep_score = min(self.lead_dep_score + 1, 5)
@@ -195,17 +203,16 @@ class LongitudinalPlanner:
         self.lead_dep_score = max(self.lead_dep_score - 1, 0)
       
       if self.lead_dep_score >= 2:
-        self.depart_cnt = int(1.8 / DT_MDL)   # 1.5초 부스트 윈도우
+        self.depart_cnt = max(self.depart_cnt, int(2.0 / DT_MDL)) # 1.8~2.5s 취향
 
     else:
       self.prev_lead_d = 0.0
       self.depart_cnt = 0
       self.lead_dep_score = 0
-      
-    # 여기서 “딱 1번만” 감소 (블록 밖)
-    if self.depart_cnt > 0:
-      self.depart_cnt -= 1
-    
+      self.ld_dbg = 0
+      self.drate_dbg = 0.0
+      self.cap_dbg = 0.0
+
     
     # 1-추가) 위험 접근이면 감속 하한만 MIN_ACCEL로 "오픈" (모드 무관)
     if lead.status and (lead.dRel < 8.0 or (v_ego < 10.0 and lead.vRel < -3.0)):
@@ -235,9 +242,10 @@ class LongitudinalPlanner:
         close_cap = min(close_cap, interp(v_ego, [0.0, 6.0, 15.0], [0.15, 0.25, 0.40]))
         
       # depart 부스트 구간에는 close_cap을 조금 완화 (초반 반응성)
-      if self.depart_cnt > 0 and v_ego < 10.0 and d < 35.0:
-        close_cap = max(close_cap, 1.05)   # 0.8~1.1 취향
+      if self.depart_cnt > 0 and v_ego < 12.0 and d < 35.0:
+        close_cap = max(close_cap, 1.35)   # 1.2~1.5 취향
 
+      self.cap_dbg = float(close_cap)
       accel_limits[1] = min(accel_limits[1], close_cap)
 
     # 3) turns 제한은 마지막에 한 번
@@ -288,18 +296,17 @@ class LongitudinalPlanner:
     # --- (add) lead present: limit how fast we increase acceleration (positive jerk limiting)
     if lead.status:
 
-      restart_boost = (self.depart_cnt > 0) and (v_ego < 10.0)
+      restart_boost = (self.depart_cnt > 0) and (v_ego < 12.0)
       
       j_pos_limit = interp(v_ego, [0.0, 3.0, 8.0, 20.0], [0.25, 0.35, 0.55, 0.90])
 
       # 정체 재출발(앞차가 멀어짐)일 때만 +jerk 제한을 완화해서 더 빨리 따라가게
       if restart_boost:
-        j_pos_limit *= 1.3   # 1.25~1.6 사이 취향 튜닝
-      
+        j_pos_limit *= 1.9
       a_inc_max = j_pos_limit * DT_MDL
 
       if restart_boost:
-        a_inc_max = max(a_inc_max, 0.12)   # 0.05~0.08 범위 취향
+        a_inc_max = max(a_inc_max, 0.22)
       
       # +가속(증가) 제한
       if self.a_desired > a_prev:
@@ -312,6 +319,8 @@ class LongitudinalPlanner:
         if self.a_desired < a_prev:
           self.a_desired = max(self.a_desired, a_prev - a_dec_max)
 
+    if self.depart_cnt > 0:
+      self.depart_cnt -= 1
 
   def publish(self, sm, pm):
     plan_send = messaging.new_message('longitudinalPlan')
@@ -337,10 +346,16 @@ class LongitudinalPlanner:
     #self.mpc.debugLongText2 = "VisionTurn:State={},Speed={:.1f}".format(self.vision_turn_controller.state, self.vision_turn_controller.v_turn*3.6)
     #longitudinalPlan.debugLongText2 = self.mpc.debugLongText2
     lead = sm['radarState'].leadOne
+
     longitudinalPlan.debugLongText2 = (
-      f"{self.mpc.debugLongText2} | dep={self.depart_cnt} "
-      f"d={lead.dRel:.1f} vr={lead.vRel:.2f} v={sm['carState'].vEgo*3.6:.1f}"
-    ) if lead.status else f"{self.mpc.debugLongText2} | dep={self.depart_cnt} lead=0"
+      f"{self.mpc.debugLongText2}"
+      f" | dep={self.depart_cnt} sc={self.lead_dep_score} ld={self.ld_dbg}"
+      f" d={lead.dRel:.1f} vr={lead.vRel:.2f} dr={self.drate_dbg:+.2f}"
+      f" cap={self.cap_dbg:.2f} v={sm['carState'].vEgo*3.6:.1f}"
+    ) if lead.status else (
+      f"{self.mpc.debugLongText2} | dep={self.depart_cnt} sc={self.lead_dep_score} lead=0"
+    )
+    
     longitudinalPlan.trafficState = self.mpc.trafficState
     longitudinalPlan.xState = self.mpc.xState
     if self.mpc.trafficError:
