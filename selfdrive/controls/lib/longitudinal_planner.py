@@ -18,7 +18,7 @@ from common.params import Params
 LON_MPC_STEP = 0.2  # first step is 0.2s
 A_CRUISE_MIN = -1.2
 
-A_CRUISE_MAX_VALS = [1.6, 1.4, 1.2, 0.9, 0.8]
+A_CRUISE_MAX_VALS = [1.2, 1.1, 1.0, 0.85, 0.75]
 A_CRUISE_MAX_BP = [0., 20*CV.KPH_TO_MS, 40*CV.KPH_TO_MS, 60*CV.KPH_TO_MS, 80*CV.KPH_TO_MS]
 
 # Lookup table for turns
@@ -298,7 +298,7 @@ class LongitudinalPlanner:
 
       restart_boost = (self.depart_cnt > 0) and (v_ego < 12.0)
       
-      j_pos_limit = interp(v_ego, [0.0, 3.0, 8.0, 20.0], [0.25, 0.35, 0.55, 0.90])
+      j_pos_limit = interp(v_ego, [0.0, 3.0, 8.0, 20.0], [0.2, 0.25, 0.40, 0.70])
 
       # 정체 재출발(앞차가 멀어짐)일 때만 +jerk 제한을 완화해서 더 빨리 따라가게
       if restart_boost:
