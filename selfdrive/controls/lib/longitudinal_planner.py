@@ -18,7 +18,7 @@ from common.params import Params
 LON_MPC_STEP = 0.2  # first step is 0.2s
 A_CRUISE_MIN = -1.2
 
-A_CRUISE_MAX_VALS = [1.2, 1.1, 1.0, 0.85, 0.75]
+A_CRUISE_MAX_VALS = [1.2, 1.1, 1.0, 0.85, 0.70]
 A_CRUISE_MAX_BP = [0., 20*CV.KPH_TO_MS, 40*CV.KPH_TO_MS, 60*CV.KPH_TO_MS, 80*CV.KPH_TO_MS]
 
 # Lookup table for turns
@@ -213,6 +213,12 @@ class LongitudinalPlanner:
       self.drate_dbg = 0.0
       self.cap_dbg = 0.0
 
+    # 🔧 80~100km/h 구간에서 과한 가속 억제 (킥다운 방지)
+    if 22.0 <= v_ego <= 30.0:
+      if not lead.status:
+        accel_limits[1] = min(accel_limits[1], 0.55)
+      elif lead.dRel > 35.0:
+        accel_limits[1] = min(accel_limits[1], 0.60)
     
     # 1-추가) 위험 접근이면 감속 하한만 MIN_ACCEL로 "오픈" (모드 무관)
     if lead.status and (lead.dRel < 8.0 or (v_ego < 10.0 and lead.vRel < -3.0)):
@@ -298,7 +304,7 @@ class LongitudinalPlanner:
 
       restart_boost = (self.depart_cnt > 0) and (v_ego < 12.0)
       
-      j_pos_limit = interp(v_ego, [0.0, 3.0, 8.0, 20.0], [0.2, 0.25, 0.40, 0.70])
+      j_pos_limit = interp(v_ego, [0.0, 3.0, 8.0, 20.0, 25.0, 30.0], [0.25, 0.35, 0.55, 0.75, 0.60, 0.50])
 
       # 정체 재출발(앞차가 멀어짐)일 때만 +jerk 제한을 완화해서 더 빨리 따라가게
       if restart_boost:
