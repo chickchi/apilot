@@ -299,6 +299,7 @@ class LongitudinalPlanner:
     self.a_desired = float(interp(DT_MDL, T_IDXS[:CONTROL_N], self.a_desired_trajectory))
     self.v_desired_filter.x = self.v_desired_filter.x + DT_MDL * (self.a_desired + a_prev) / 2.0
 
+    restart_boost = (self.depart_cnt > 0) and (v_ego < 12.0)
     j_pos_limit = interp(v_ego,
                          [0.0, 3.0, 8.0, 20.0, 25.0, 30.0],
                          [0.25, 0.35, 0.55, 0.75, 0.60, 0.50])
