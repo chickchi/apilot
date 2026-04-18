@@ -299,26 +299,22 @@ class LongitudinalPlanner:
     self.a_desired = float(interp(DT_MDL, T_IDXS[:CONTROL_N], self.a_desired_trajectory))
     self.v_desired_filter.x = self.v_desired_filter.x + DT_MDL * (self.a_desired + a_prev) / 2.0
 
-    # --- (add) lead present: limit how fast we increase acceleration (positive jerk limiting)
+    j_pos_limit = interp(v_ego,
+                         [0.0, 3.0, 8.0, 20.0, 25.0, 30.0],
+                         [0.25, 0.35, 0.55, 0.75, 0.60, 0.50])
+
+    if restart_boost:
+      j_pos_limit *= 1.9
+
+    a_inc_max = j_pos_limit * DT_MDL
+
+    if restart_boost:
+      a_inc_max = max(a_inc_max, 0.22)
+
+    if self.a_desired > a_prev:
+      self.a_desired = min(self.a_desired, a_prev + a_inc_max)
+
     if lead.status:
-
-      restart_boost = (self.depart_cnt > 0) and (v_ego < 12.0)
-      
-      j_pos_limit = interp(v_ego, [0.0, 3.0, 8.0, 20.0, 25.0, 30.0], [0.25, 0.35, 0.55, 0.75, 0.60, 0.50])
-
-      # 정체 재출발(앞차가 멀어짐)일 때만 +jerk 제한을 완화해서 더 빨리 따라가게
-      if restart_boost:
-        j_pos_limit *= 1.9
-      a_inc_max = j_pos_limit * DT_MDL
-
-      if restart_boost:
-        a_inc_max = max(a_inc_max, 0.22)
-      
-      # +가속(증가) 제한
-      if self.a_desired > a_prev:
-        self.a_desired = min(self.a_desired, a_prev + a_inc_max)
-      
-      # -감속(감소)도 저속에서만 부드럽게 제한 (정체 구간 타겟)
       if v_ego < 10.0 and lead.dRel < 30.0 and not (lead.dRel < 8.0 or lead.vRel < -3.0):
         j_neg_limit = interp(v_ego, [0.0, 3.0, 8.0, 10.0], [0.35, 0.50, 0.80, 1.20])
         a_dec_max = j_neg_limit * DT_MDL
