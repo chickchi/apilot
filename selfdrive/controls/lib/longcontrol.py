@@ -187,7 +187,18 @@ class LongControl:
 
     self.last_output_accel = clip(output_accel, accel_limits[0], accel_limits[1])
 
-    #self.debugLoCText = "T:{:.2f} V:{:.2f}={:.1f}-{:.1f} Aout:{:.2f}<{:.2f}".format(t_since_plan, (self.v_pid - CS.vEgo)*3.6, self.v_pid*3.6, CS.vEgo*3.3, self.last_output_accel, output_accel)
-    #C2# self.debugLoCText = "pid={},vego={:.2f},vt={:.2f},{:.2f},vStop={:.2f}".format(self.long_control_state, CS.vEgo, v_target, v_target_1sec, self.CP.vEgoStopping)
+    # DEBUG ONLY: longitudinal PID chain.
+    # E  = raw speed error before deadzone [m/s]
+    # AN = current acceleration from longitudinalPlan [m/s^2]
+    # AT = actuator-delay adjusted acceleration used as PID feed-forward [m/s^2]
+    # P/I/F = PID contributions
+    # O  = final LongControl accel output after PID/limits [m/s^2]
+    # AE = measured vehicle acceleration [m/s^2]
+    self.debugLoCText = (
+      f"LC E={self.v_pid - CS.vEgo:+.2f}"
+      f" AN={a_target_now:.2f} AT={a_target:.2f}"
+      f" P={self.pid.p:.2f} I={self.pid.i:.2f} F={self.pid.f:.2f}"
+      f" O={self.last_output_accel:.2f} AE={CS.aEgo:.2f}"
+    )
 
     return self.last_output_accel, -0.5 if planned_stop else j_target
