@@ -904,11 +904,11 @@ class Controls:
     controlsState.vCruiseCluster = float(self.v_cruise_helper.v_cruise_cluster_kph)
     controlsState.vCruiseOut = self.cruise_helper.v_cruise_kph_apply #min(self.pcmLongSpeed, self.cruise_helper.v_cruise_kph_apply)
 
-    #ajouatom
-    controlsState.debugText1 = self.debugText1
-    #self.debugText2 = self.LoC.debugLoCText
-    #self.debugText2 = self.LaC.latDebugText
-    controlsState.debugText2 = self.debugText2
+    # DEBUG ONLY:
+    # The existing aPilot UI already renders controlsState.debugText1/2.
+    # Reuse those two lines so no paint.cc/schema modification is required.
+    controlsState.debugText1 = self.sm['longitudinalPlan'].debugLongText2
+    controlsState.debugText2 = self.LoC.debugLoCText
     controlsState.longActiveUser = self.cruise_helper.longActiveUser
     controlsState.longActiveUserReady = self.cruise_helper.longActiveUserReady
     controlsState.cruiseButtonCounter = self.cruiseButtonCounter
