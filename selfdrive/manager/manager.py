@@ -85,6 +85,7 @@ def manager_init() -> None:
     ("AutoTurnControlSpeedTurn", "20"),
     ("AutoTurnControlTurnEnd", "3"),
     ("AutoLaneChangeSpeed", "30"),
+    ("LaneChangeAssist", "1"),
     ("AutoNaviSpeedCtrl", "1"),
     ("AutoNaviSpeedCtrlMode", "0"),
     ("AutoNaviSpeedCtrlStart", "22"),
