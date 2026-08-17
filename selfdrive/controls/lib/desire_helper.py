@@ -141,6 +141,7 @@ class DesireHelper:
       self.autoTurnControlSpeedLaneChange = int(Params().get("AutoTurnControlSpeedLaneChange", encoding="utf8"))
       self.autoTurnControlSpeedTurn = int(Params().get("AutoTurnControlSpeedTurn", encoding="utf8"))
       self.autoLaneChangeSpeed = int(Params().get("AutoLaneChangeSpeed", encoding="'utf8"))
+      self.laneChangeAssist = Params().get_bool("LaneChangeAssist")
       self.paramsCount = 0
 
   def detect_road_edge(self, md):
@@ -269,6 +270,18 @@ class DesireHelper:
       need_torque = 0
       self.desireReady = 0
 
+    # Lane Change Assist OFF:
+    # - disable navigation lane-change requests
+    # - preserve real navigation turns (nav_turn) and unrelated turn/speed control
+    nav_lane_change = nav_direction != LaneChangeDirection.none and not nav_turn
+    if not self.laneChangeAssist and nav_lane_change:
+      nav_direction = LaneChangeDirection.none
+      need_torque = 0
+      nav_event = 0
+      self.desireReady = 0
+      self.apNaviDistance = 0
+      self.apNaviSpeed = 0
+
     # 음성인식등.
     if roadLimitSpeed.xIndex > 0:
       if roadLimitSpeed.xCmd == "LANECHANGE":
@@ -320,9 +333,12 @@ class DesireHelper:
     self.desire = log.LateralPlan.Desire.none
     self.desireEvent = 0
     self.latDebugText = "DH:{},EDGE:{},Nav:{},{}".format(self.lane_change_state, road_edge_stat, nav_direction, nav_turn)
-    if not lateral_active or self.lane_change_timer > LANE_CHANGE_TIME_MAX:
+    if not lateral_active or self.lane_change_timer > LANE_CHANGE_TIME_MAX or (not self.laneChangeAssist and not nav_turn):
       self.lane_change_state = LaneChangeState.off
       self.lane_change_direction = LaneChangeDirection.none
+      self.lane_change_ll_prob = 1.0
+      self.needTorque = False
+      self.turnState = 0
     else:
       if self.lane_change_state == LaneChangeState.off and one_blinker and not self.prev_one_blinker: # and not below_lane_change_speed:
         self.lane_change_state = LaneChangeState.preLaneChange
@@ -346,8 +362,10 @@ class DesireHelper:
               elif roadedge_detected:
                 self.desireEvent = EventName.laneChangeRoadEdge
               else:
-                if leftBlinker and v_ego_kph < self.autoLaneChangeSpeed: # 저속에 좌측차로변경 토크필요
-                  need_torque = 2
+                # Lane Change Assist ON (A mode):
+                # blinker alone only prepares the lane change.
+                # Same-direction driver steering torque is required to start.
+                need_torque = 2
                 self.lane_change_state = LaneChangeState.laneChangeStarting
             else: # 네비..
               if steering_pressed:
@@ -423,7 +441,7 @@ class DesireHelper:
         if self.lane_change_ll_prob > 0.99:
           self.lane_change_state = LaneChangeState.off
           self.turnState = 0
-          if one_blinker:
+          if one_blinker and self.laneChangeAssist:
             self.lane_change_state = LaneChangeState.preLaneChange
             self.needTorque = True # 두번째부터 토크...
           else:
