@@ -362,15 +362,20 @@ class LongitudinalPlanner:
     #longitudinalPlan.debugLongText2 = self.mpc.debugLongText2
     lead = sm['radarState'].leadOne
 
+    # DEBUG ONLY: planner/MPC acceleration chain.
+    # GH = gear-hold acceleration cap
+    # AM = final max acceleration actually passed to MPC
+    # AD = planner internal desired acceleration after smoothing
+    # A0 = first point of MPC acceleration trajectory sent in longitudinalPlan
     longitudinalPlan.debugLongText2 = (
-      f"{self.mpc.debugLongText2}"
-      f" | dep={self.depart_cnt} sc={self.lead_dep_score} ld={self.ld_dbg}"
-      f" d={lead.dRel:.1f} vr={lead.vRel:.2f} dr={self.drate_dbg:+.2f}"
-      f" cap={self.cap_dbg:.2f} gh={self.gear_hold_cap_dbg:.2f}"
-      f" amax={self.final_accel_max_dbg:.2f} v={sm['carState'].vEgo*3.6:.1f}"
+      f"PL V={sm['carState'].vEgo*3.6:.1f}"
+      f" GH={self.gear_hold_cap_dbg:.2f} AM={self.final_accel_max_dbg:.2f}"
+      f" AD={self.a_desired:.2f} A0={self.a_desired_trajectory[0]:.2f}"
+      f" D={lead.dRel:.1f} VR={lead.vRel:+.2f}"
     ) if lead.status else (
-      f"{self.mpc.debugLongText2} | dep={self.depart_cnt} sc={self.lead_dep_score} lead=0"
-      f" gh={self.gear_hold_cap_dbg:.2f} amax={self.final_accel_max_dbg:.2f}"
+      f"PL V={sm['carState'].vEgo*3.6:.1f}"
+      f" GH={self.gear_hold_cap_dbg:.2f} AM={self.final_accel_max_dbg:.2f}"
+      f" AD={self.a_desired:.2f} A0={self.a_desired_trajectory[0]:.2f} L=0"
     )
     
     longitudinalPlan.trafficState = self.mpc.trafficState
