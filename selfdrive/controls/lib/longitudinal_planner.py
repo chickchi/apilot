@@ -83,6 +83,8 @@ class LongitudinalPlanner:
     self.ld_dbg = 0
     self.drate_dbg = 0.0
     self.cap_dbg = 0.0
+    self.gear_hold_cap_dbg = 0.0
+    self.final_accel_max_dbg = 0.0
 
   def read_param(self):
     #try:
@@ -213,12 +215,19 @@ class LongitudinalPlanner:
       self.drate_dbg = 0.0
       self.cap_dbg = 0.0
 
-    # 🔧 80~100km/h 구간에서 과한 가속 억제 (킥다운 방지)
-    if 22.0 <= v_ego <= 30.0:
-      if not lead.status:
-        accel_limits[1] = min(accel_limits[1], 0.55)
-      elif lead.dRel > 35.0:
-        accel_limits[1] = min(accel_limits[1], 0.60)
+    # 🔧 72~115km/h 저토크 재가속: 6단 유지 / 불필요한 5단 킥다운 억제
+    # - lead 유무/거리와 무관하게 적용: 앞차 감속 후 20~30m 거리에서 재가속할 때도 빠지지 않음
+    # - 72km/h부터 시작: 80km/h에 도달하기 전에 이미 5단으로 내려가는 현상 방지
+    # - 위험 접근/close_cap/turn 제한은 아래에서 더 낮출 수 있으므로 감속 안전 로직은 그대로 우선
+    self.gear_hold_cap_dbg = 0.0
+    if 20.0 <= v_ego <= 32.0:
+      gear_hold_cap = interp(
+        v_ego,
+        [20.0, 22.0, 25.0, 28.0, 30.0, 32.0],
+        [0.50, 0.48, 0.45, 0.42, 0.40, 0.38],
+      )
+      accel_limits[1] = min(accel_limits[1], gear_hold_cap)
+      self.gear_hold_cap_dbg = float(gear_hold_cap)
     
     # 1-추가) 위험 접근이면 감속 하한만 MIN_ACCEL로 "오픈" (모드 무관)
     if lead.status and (lead.dRel < 8.0 or (v_ego < 10.0 and lead.vRel < -3.0)):
@@ -256,6 +265,7 @@ class LongitudinalPlanner:
 
     # 3) turns 제한은 마지막에 한 번
     accel_limits_turns = limit_accel_in_turns(v_ego, sm['carState'].steeringAngleDeg, accel_limits, self.CP)
+    self.final_accel_max_dbg = float(accel_limits_turns[1])
 
 
     if reset_state:
@@ -354,9 +364,11 @@ class LongitudinalPlanner:
       f"{self.mpc.debugLongText2}"
       f" | dep={self.depart_cnt} sc={self.lead_dep_score} ld={self.ld_dbg}"
       f" d={lead.dRel:.1f} vr={lead.vRel:.2f} dr={self.drate_dbg:+.2f}"
-      f" cap={self.cap_dbg:.2f} v={sm['carState'].vEgo*3.6:.1f}"
+      f" cap={self.cap_dbg:.2f} gh={self.gear_hold_cap_dbg:.2f}"
+      f" amax={self.final_accel_max_dbg:.2f} v={sm['carState'].vEgo*3.6:.1f}"
     ) if lead.status else (
       f"{self.mpc.debugLongText2} | dep={self.depart_cnt} sc={self.lead_dep_score} lead=0"
+      f" gh={self.gear_hold_cap_dbg:.2f} amax={self.final_accel_max_dbg:.2f}"
     )
     
     longitudinalPlan.trafficState = self.mpc.trafficState
