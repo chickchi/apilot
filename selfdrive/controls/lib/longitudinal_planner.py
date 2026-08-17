@@ -19,7 +19,7 @@ LON_MPC_STEP = 0.2  # first step is 0.2s
 A_CRUISE_MIN = -1.2
 
 A_CRUISE_MAX_VALS = [1.2, 1.1, 1.0, 0.85, 0.75]
-A_CRUISE_MAX_BP = [0., 20*CV.KPH_TO_MS, 40*CV.KPH_TO_MS, 60*CV.KPH_TO_MS, 80*CV.KPH_TO_MS]
+A_CRUISE_MAX_BP = [0., 40 * CV.KPH_TO_MS, 60 * CV.KPH_TO_MS, 80 * CV.KPH_TO_MS, 110 * CV.KPH_TO_MS, 140 * CV.KPH_TO_MS]
 
 # Lookup table for turns
 _A_TOTAL_MAX_V = [2.0, 3.2]
@@ -265,7 +265,6 @@ class LongitudinalPlanner:
 
     # 3) turns 제한은 마지막에 한 번
     accel_limits_turns = limit_accel_in_turns(v_ego, sm['carState'].steeringAngleDeg, accel_limits, self.CP)
-    self.final_accel_max_dbg = float(accel_limits_turns[1])
 
 
     if reset_state:
@@ -285,6 +284,9 @@ class LongitudinalPlanner:
     # clip limits, cannot init MPC outside of bounds
     accel_limits_turns[0] = min(accel_limits_turns[0], self.a_desired + 0.05)
     accel_limits_turns[1] = max(accel_limits_turns[1], self.a_desired - 0.05)
+
+    # 실제 MPC에 전달되는 최종 acceleration upper limit 기록
+    self.final_accel_max_dbg = float(accel_limits_turns[1])
 
     #self.mpc.set_weights(prev_accel_constraint)
     self.mpc.set_accel_limits(accel_limits_turns[0], accel_limits_turns[1])
