@@ -78,8 +78,12 @@ class LongControl:
     # acceleration demand after the longitudinal PID calculation.
     self.raw_output_accel = 0.0
     self.pos_accel_jerk_limit = 0.0
+    self.pos_accel_headroom = 0.0
+    self.pos_accel_comfort_cap = 0.0
     self.pos_accel_cut = 0.0
     self.pos_accel_limited = False
+    self.pos_accel_jerk_limited = False
+    self.pos_accel_headroom_limited = False
 
     self.longitudinalActuatorDelayLowerBound = float(int(Params().get("LongitudinalActuatorDelayLowerBound", encoding="utf8"))) * 0.01
     self.longitudinalActuatorDelayUpperBound = float(int(Params().get("LongitudinalActuatorDelayUpperBound", encoding="utf8"))) * 0.01
@@ -195,71 +199,103 @@ class LongControl:
                                      freeze_integrator=freeze_integrator)
 
     # ----------------------------------------------------------------------
-    # v1.3 Smooth Positive Acceleration
+    # v1.4 Smooth Positive Acceleration + PID Comfort Headroom
     #
-    # Goal:
-    #   Make acceleration feel like a gently applied accelerator pedal:
-    #   normal downshifts are allowed, but positive torque demand should not
-    #   jump abruptly and flare RPM after a deceleration.
+    # Why shape the PID output instead of retuning the PID itself?
+    #   The PID is still useful for speed-error, grade/load and actuator
+    #   compensation.  The vehicle-specific problem seen in the road tests is
+    #   that a large positive PID correction can sit on top of the planner
+    #   feed-forward and create a torque request large enough to trigger a
+    #   harsh 6->5 or 5->4 kickdown.
     #
-    # Strategy:
-    #   * Limit only the RISE RATE of positive acceleration demand.
-    #   * Do not impose an extra absolute accel cap here.
-    #   * A falling accel request is passed through immediately so torque can
-    #     come off quickly near the set speed and help a natural upshift.
-    #   * Negative acceleration / braking is never slew-limited here.
+    # v1.4 therefore keeps the PID calculation intact, but constrains only
+    # POSITIVE acceleration after the calculation:
     #
-    # Video-derived tuning:
-    #   The v1.2 test showed roughly 0.41 -> 0.59 m/s^2 in ~0.25 s
-    #   around 82-84 km/h (~0.72 m/s^3).  The curve below intentionally
-    #   reduces that rise rate to ~0.18 m/s^3 at 80 km/h and 0.15 at 100.
+    #   final positive output =
+    #       min(raw PID output,
+    #           previous positive output + J+ * DT_CTRL,
+    #           max(a_target, 0) + speed-dependent headroom)
+    #
+    # The two limits do different jobs:
+    #   J+       : how FAST the accelerator request may increase.
+    #   headroom : how FAR above the planner feed-forward PID may push.
+    #
+    # Falling accel demand and all negative accel/braking are passed through
+    # immediately; there is no extra brake slew limit here.
     # ----------------------------------------------------------------------
     self.raw_output_accel = float(output_accel)
     self.pos_accel_jerk_limit = 0.0
+    self.pos_accel_headroom = 0.0
+    self.pos_accel_comfort_cap = 0.0
     self.pos_accel_cut = 0.0
     self.pos_accel_limited = False
+    self.pos_accel_jerk_limited = False
+    self.pos_accel_headroom_limited = False
 
     if self.long_control_state == LongCtrlState.pid and output_accel > 0.0:
       v_ego_kph = CS.vEgo * 3.6
 
-      # Maximum positive accel-command rise rate [m/s^3].
-      # Tuned from the recorded v1.2 kickdown test.
+      # v1.3 video-derived positive accel rise-rate limit [m/s^3].
       self.pos_accel_jerk_limit = interp(
         v_ego_kph,
         [0.0, 20.0, 40.0, 60.0, 80.0, 100.0, 120.0, 140.0],
         [0.45, 0.38, 0.30, 0.24, 0.18, 0.15, 0.13, 0.12],
       )
 
-      # If the previous command was braking, release braking normally but
-      # build positive torque again from zero.  If already accelerating,
-      # continue from the previous positive output.
+      # v1.4 PID positive headroom above the planner feed-forward [m/s^2].
+      # Low speed retains more correction authority for launch/load changes.
+      # From ~70 km/h upward, only a small positive correction is allowed
+      # so a large speed error cannot create a large kickdown torque request.
+      self.pos_accel_headroom = interp(
+        v_ego_kph,
+        [0.0, 20.0, 40.0, 60.0, 70.0, 80.0, 100.0, 120.0, 140.0],
+        [0.20, 0.20, 0.15, 0.08, 0.05, 0.05, 0.04, 0.04, 0.04],
+      )
+
+      # Planner-based comfort envelope.  max(a_target, 0) intentionally allows
+      # a small PID-only correction (the headroom itself) even when a_target
+      # is zero or slightly negative.
+      self.pos_accel_comfort_cap = max(a_target, 0.0) + self.pos_accel_headroom
+
+      # J+ ceiling: positive torque builds from the previous positive output.
+      # If the previous command was braking, positive torque starts from zero.
       positive_base = max(self.last_output_accel, 0.0)
       positive_rise_max = positive_base + self.pos_accel_jerk_limit * DT_CTRL
 
-      if output_accel > positive_rise_max:
-        output_accel = positive_rise_max
-        self.pos_accel_limited = True
+      raw_positive = output_accel
+      output_accel = min(raw_positive, positive_rise_max, self.pos_accel_comfort_cap)
+
+      eps = 1e-5
+      self.pos_accel_jerk_limited = positive_rise_max + eps < raw_positive and positive_rise_max <= self.pos_accel_comfort_cap + eps
+      self.pos_accel_headroom_limited = self.pos_accel_comfort_cap + eps < raw_positive and self.pos_accel_comfort_cap <= positive_rise_max + eps
+      self.pos_accel_limited = output_accel + eps < raw_positive
 
     self.last_output_accel = clip(output_accel, accel_limits[0], accel_limits[1])
     self.pos_accel_cut = max(self.raw_output_accel - self.last_output_accel, 0.0)
 
-    # Compact v1.3 debug:
+    # Compact v1.4 debug:
     # E   : raw speed error [m/s]
-    # AT  : actuator-delay adjusted accel target used by PID feed-forward
+    # AT  : actuator-delay adjusted planner accel used as PID feed-forward
     # P/I/F: PID contributions
-    # R   : raw PID output before v1.3 smoothing
+    # R   : raw PID output
+    # H   : allowed positive PID headroom above planner [m/s^2]
+    # PC  : planner comfort cap = max(AT, 0) + H
     # J   : allowed positive rise rate [m/s^3]
     # O   : final accel command sent downstream
-    # CUT : amount removed by the v1.3 limiter [m/s^2]
-    # L   : limiter active (1/0)
+    # C   : amount removed from raw PID output
+    # HL  : headroom cap is the active limiting ceiling
+    # JL  : J+ slew ceiling is the active limiting ceiling
     # AE  : measured vehicle acceleration
     self.debugLoCText = (
       f"LC E={self.v_pid - CS.vEgo:+.2f}"
       f" AT={a_target:.2f}"
       f" P={self.pid.p:.2f} I={self.pid.i:.2f} F={self.pid.f:.2f}"
-      f" R={self.raw_output_accel:.2f} J={self.pos_accel_jerk_limit:.2f}"
-      f" O={self.last_output_accel:.2f} CUT={self.pos_accel_cut:.2f}"
-      f" L={int(self.pos_accel_limited)} AE={CS.aEgo:.2f}"
+      f" R={self.raw_output_accel:.2f}"
+      f" H={self.pos_accel_headroom:.2f} PC={self.pos_accel_comfort_cap:.2f}"
+      f" J={self.pos_accel_jerk_limit:.2f} O={self.last_output_accel:.2f}"
+      f" C={self.pos_accel_cut:.2f}"
+      f" HL={int(self.pos_accel_headroom_limited)} JL={int(self.pos_accel_jerk_limited)}"
+      f" AE={CS.aEgo:.2f}"
     )
 
     return self.last_output_accel, -0.5 if planned_stop else j_target
