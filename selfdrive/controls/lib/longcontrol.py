@@ -72,6 +72,15 @@ class LongControl:
     self.longitudinalTuningKf = 1.0
     self.startAccelApply = 0.0
     self.stopAccelApply = 0.0
+
+    # v1.3 smooth positive acceleration state/debug
+    # This does not force any gear. It only smooths the rise of positive
+    # acceleration demand after the longitudinal PID calculation.
+    self.raw_output_accel = 0.0
+    self.pos_accel_jerk_limit = 0.0
+    self.pos_accel_cut = 0.0
+    self.pos_accel_limited = False
+
     self.longitudinalActuatorDelayLowerBound = float(int(Params().get("LongitudinalActuatorDelayLowerBound", encoding="utf8"))) * 0.01
     self.longitudinalActuatorDelayUpperBound = float(int(Params().get("LongitudinalActuatorDelayUpperBound", encoding="utf8"))) * 0.01
 
@@ -185,20 +194,72 @@ class LongControl:
                                      feedforward=a_target,
                                      freeze_integrator=freeze_integrator)
 
-    self.last_output_accel = clip(output_accel, accel_limits[0], accel_limits[1])
+    # ----------------------------------------------------------------------
+    # v1.3 Smooth Positive Acceleration
+    #
+    # Goal:
+    #   Make acceleration feel like a gently applied accelerator pedal:
+    #   normal downshifts are allowed, but positive torque demand should not
+    #   jump abruptly and flare RPM after a deceleration.
+    #
+    # Strategy:
+    #   * Limit only the RISE RATE of positive acceleration demand.
+    #   * Do not impose an extra absolute accel cap here.
+    #   * A falling accel request is passed through immediately so torque can
+    #     come off quickly near the set speed and help a natural upshift.
+    #   * Negative acceleration / braking is never slew-limited here.
+    #
+    # Video-derived tuning:
+    #   The v1.2 test showed roughly 0.41 -> 0.59 m/s^2 in ~0.25 s
+    #   around 82-84 km/h (~0.72 m/s^3).  The curve below intentionally
+    #   reduces that rise rate to ~0.18 m/s^3 at 80 km/h and 0.15 at 100.
+    # ----------------------------------------------------------------------
+    self.raw_output_accel = float(output_accel)
+    self.pos_accel_jerk_limit = 0.0
+    self.pos_accel_cut = 0.0
+    self.pos_accel_limited = False
 
-    # DEBUG ONLY: longitudinal PID chain.
-    # E  = raw speed error before deadzone [m/s]
-    # AN = current acceleration from longitudinalPlan [m/s^2]
-    # AT = actuator-delay adjusted acceleration used as PID feed-forward [m/s^2]
-    # P/I/F = PID contributions
-    # O  = final LongControl accel output after PID/limits [m/s^2]
-    # AE = measured vehicle acceleration [m/s^2]
+    if self.long_control_state == LongCtrlState.pid and output_accel > 0.0:
+      v_ego_kph = CS.vEgo * 3.6
+
+      # Maximum positive accel-command rise rate [m/s^3].
+      # Tuned from the recorded v1.2 kickdown test.
+      self.pos_accel_jerk_limit = interp(
+        v_ego_kph,
+        [0.0, 20.0, 40.0, 60.0, 80.0, 100.0, 120.0, 140.0],
+        [0.45, 0.38, 0.30, 0.24, 0.18, 0.15, 0.13, 0.12],
+      )
+
+      # If the previous command was braking, release braking normally but
+      # build positive torque again from zero.  If already accelerating,
+      # continue from the previous positive output.
+      positive_base = max(self.last_output_accel, 0.0)
+      positive_rise_max = positive_base + self.pos_accel_jerk_limit * DT_CTRL
+
+      if output_accel > positive_rise_max:
+        output_accel = positive_rise_max
+        self.pos_accel_limited = True
+
+    self.last_output_accel = clip(output_accel, accel_limits[0], accel_limits[1])
+    self.pos_accel_cut = max(self.raw_output_accel - self.last_output_accel, 0.0)
+
+    # Compact v1.3 debug:
+    # E   : raw speed error [m/s]
+    # AT  : actuator-delay adjusted accel target used by PID feed-forward
+    # P/I/F: PID contributions
+    # R   : raw PID output before v1.3 smoothing
+    # J   : allowed positive rise rate [m/s^3]
+    # O   : final accel command sent downstream
+    # CUT : amount removed by the v1.3 limiter [m/s^2]
+    # L   : limiter active (1/0)
+    # AE  : measured vehicle acceleration
     self.debugLoCText = (
       f"LC E={self.v_pid - CS.vEgo:+.2f}"
-      f" AN={a_target_now:.2f} AT={a_target:.2f}"
+      f" AT={a_target:.2f}"
       f" P={self.pid.p:.2f} I={self.pid.i:.2f} F={self.pid.f:.2f}"
-      f" O={self.last_output_accel:.2f} AE={CS.aEgo:.2f}"
+      f" R={self.raw_output_accel:.2f} J={self.pos_accel_jerk_limit:.2f}"
+      f" O={self.last_output_accel:.2f} CUT={self.pos_accel_cut:.2f}"
+      f" L={int(self.pos_accel_limited)} AE={CS.aEgo:.2f}"
     )
 
     return self.last_output_accel, -0.5 if planned_stop else j_target
