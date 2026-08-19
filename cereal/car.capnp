@@ -239,6 +239,8 @@ struct CarState {
   speedLimit @54 : Int32;
   speedLimitDistance @55 : Float32;
   currentGear @56 : Int32; # actual transmission gear (1..8) when available, 0=unknown
+  tcuRpm @57 : Float32; # TCU12.N_TC_RAW rpm when available, 0=unknown
+  targetGear @58 : Int32; # TCU13.CF_Tcu_TarGr (1..8) when available, 0=unknown
 
   struct Tpms {
     fl @0 :Float32;
