@@ -338,10 +338,17 @@ class LongControl:
     dv_kph = max(cruise_target_kph - v_ego_kph, 0.0)
 
     engine_rpm = float(CS.engineRpm)
+    tcu_rpm = float(CS.tcuRpm)
     current_gear = int(CS.currentGear)
+    target_gear = int(CS.targetGear)
     gear_valid = 1 <= current_gear <= 8
+    target_gear_valid = 1 <= target_gear <= 8
 
-    # Speed-dependent high-RPM evidence.  This is not a gear detector.
+    # v1.5.2: current gear is primary evidence. RPM is fallback only.
+    # engineRpm remains visible; if it is unavailable, use TCU12.N_TC_RAW.
+    assist_rpm = engine_rpm if engine_rpm > 700.0 else tcu_rpm
+    rpm_valid = assist_rpm > 700.0
+
     self.upshift_rpm_threshold = interp(
       v_ego_kph,
       [78.0, 82.0, 85.0, 88.0, 92.0, 96.0],
@@ -349,48 +356,56 @@ class LongControl:
     )
 
     driver_override = CS.gasPressed or CS.brakePressed
-    rpm_valid = engine_rpm > 700.0
-    high_rpm = rpm_valid and engine_rpm >= self.upshift_rpm_threshold
-
-    # Real TCU gear is preferred when available.  If the platform cannot
-    # publish a verified numeric gear, retain the RPM-based fallback.
-    lower_gear_candidate = (current_gear in (4, 5)) if gear_valid else True
+    high_rpm = rpm_valid and assist_rpm >= self.upshift_rpm_threshold
+    gear_candidate = gear_valid and current_gear in (4, 5)
+    rpm_fallback_candidate = (not gear_valid) and high_rpm
+    upshift_candidate = gear_candidate or rpm_fallback_candidate
 
     # Simple grade/load guard: do not request an upshift when the car is not
     # actually accelerating under the current positive command.
     accel_response_ok = CS.aEgo > 0.08
 
-    # v1.5.1 high-RPM debounce: require ~0.18 s of continuous evidence before
-    # entering U=1, avoiding a transient RPM spike or shift flare trigger.
+    # v1.5.2 debounce. With valid G=4/5, RPM is not required.
+    # G=5 waits until 84 km/h, matching the desired mid-80s 5->6 behavior.
+    gear_speed_ok = (
+      (current_gear == 4 and 82.0 <= v_ego_kph <= 92.0) or
+      (current_gear == 5 and 84.0 <= v_ego_kph <= 92.0)
+    ) if gear_valid else (82.0 <= v_ego_kph <= 92.0)
+
     debounce_context = (
       self.long_control_state == LongCtrlState.pid and
       not driver_override and
       self.upshift_state == 0 and
       self.upshift_cooldown <= 0.0 and
-      82.0 <= v_ego_kph <= 92.0 and
+      gear_speed_ok and
       4.0 <= dv_kph <= 22.0 and
       output_accel >= 0.28 and
       accel_response_ok and
-      high_rpm and
-      lower_gear_candidate
+      upshift_candidate
     )
     if debounce_context:
       self.upshift_high_rpm_timer = min(self.upshift_high_rpm_timer + DT_CTRL, 0.50)
     else:
       self.upshift_high_rpm_timer = 0.0
 
+    recovery_evidence = (
+      self.upshift_recent_decel > 0.0
+      if gear_valid
+      else (self.upshift_recent_decel > 0.0 or
+            (rpm_valid and assist_rpm >= self.upshift_rpm_threshold + 250.0))
+    )
     trigger_window = (
       debounce_context and
       self.upshift_high_rpm_timer >= 0.18 and
-      (self.upshift_recent_decel > 0.0 or engine_rpm >= self.upshift_rpm_threshold + 250.0)
+      recovery_evidence
     )
 
     if trigger_window:
       self.upshift_state = 1
       self.upshift_timer = 0.0
       self.upshift_entry_output = max(output_accel, 0.0)
-      self.upshift_entry_rpm = engine_rpm
-      self.upshift_peak_rpm = engine_rpm
+      self.upshift_entry_rpm = assist_rpm if rpm_valid else 0.0
+      self.upshift_peak_rpm = assist_rpm if rpm_valid else 0.0
       self.upshift_entry_speed = v_ego_kph
       self.upshift_entry_gear = current_gear if gear_valid else 0
       # Hold post-shift low load toward ~95 km/h for a 100 km/h recovery.
@@ -398,14 +413,14 @@ class LongControl:
       self.upshift_post_target_speed = min(95.0, max(v_ego_kph + 5.0, cruise_target_kph - 4.0))
       self.upshift_shift_detected = False
 
-    # Abort on driver intervention, braking demand, a new slowdown, invalid
-    # RPM telemetry, or leaving the useful recovery region.
+    # RPM is not mandatory while verified currentGear is available.
+    transmission_evidence_available = gear_valid or rpm_valid
     abort_assist = (
       self.upshift_state in (1, 2) and (
         driver_override or
         self.long_control_state != LongCtrlState.pid or
         self.raw_output_accel <= 0.0 or
-        not rpm_valid or
+        not transmission_evidence_available or
         v_ego_kph < 78.0 or
         v_ego_kph > 98.0 or
         dv_kph < 1.5 or
@@ -421,7 +436,8 @@ class LongControl:
 
     elif self.upshift_state == 1:
       self.upshift_timer += DT_CTRL
-      self.upshift_peak_rpm = max(self.upshift_peak_rpm, engine_rpm)
+      if rpm_valid:
+        self.upshift_peak_rpm = max(self.upshift_peak_rpm, assist_rpm)
 
       # Smoothly lift toward a low positive request rather than dropping the
       # accel command abruptly.
@@ -438,10 +454,13 @@ class LongControl:
 
       # Prefer verified TCU gear.  This distinguishes 4->5 from 5->6.
       # With unknown gear, retain the original RPM-drop fallback.
-      rpm_drop = self.upshift_peak_rpm - engine_rpm
+      rpm_drop = (self.upshift_peak_rpm - assist_rpm) if rpm_valid else 0.0
       speed_held = v_ego_kph >= self.upshift_entry_speed - 0.8
       reached_top_gear = gear_valid and current_gear >= 6
-      rpm_shift_fallback = (not gear_valid) and self.upshift_timer >= 0.20 and rpm_drop >= 300.0 and speed_held
+      rpm_shift_fallback = (
+        (not gear_valid) and rpm_valid and
+        self.upshift_timer >= 0.20 and rpm_drop >= 300.0 and speed_held
+      )
       if reached_top_gear or rpm_shift_fallback:
         self.upshift_shift_detected = True
         self.upshift_state = 2
@@ -470,7 +489,7 @@ class LongControl:
       # mistaken for the final 5->6 when real gear telemetry is available.
       if gear_valid and current_gear >= 6:
         self.upshift_shift_detected = True
-      elif not gear_valid and (self.upshift_peak_rpm - engine_rpm) >= 300.0:
+      elif not gear_valid and rpm_valid and (self.upshift_peak_rpm - assist_rpm) >= 300.0:
         self.upshift_shift_detected = True
 
       # If reduced torque no longer produces forward acceleration, exit early
@@ -492,14 +511,13 @@ class LongControl:
     self.last_output_accel = clip(output_accel, accel_limits[0], accel_limits[1])
     self.pos_accel_cut = max(self.raw_output_accel - self.last_output_accel, 0.0)
 
-    # Compact v1.5.1 debug.  G=0 means numeric gear is unavailable and the
-    # RPM fallback is being used.  HD is the high-RPM debounce timer.
+    # v1.5.2 debug. TG is observation-only and never commands a shift.
     self.debugLoCText = (
       f"LC R={self.raw_output_accel:.2f} PC={self.pos_accel_comfort_cap:.2f}"
       f" J={self.pos_accel_jerk_limit:.2f} O={self.last_output_accel:.2f}"
-      f" U={self.upshift_state} G={current_gear}"
-      f" RPM={int(CS.engineRpm)}/{int(self.upshift_rpm_threshold)}"
-      f" HD={self.upshift_high_rpm_timer:.2f}"
+      f" U={self.upshift_state} G={current_gear} TG={target_gear if target_gear_valid else 0}"
+      f" ER={int(engine_rpm)} TR={int(tcu_rpm)} AR={int(assist_rpm)}"
+      f" RT={int(self.upshift_rpm_threshold)} HD={self.upshift_high_rpm_timer:.2f}"
       f" CT={cruise_target_kph:.0f} DV={dv_kph:.1f}"
       f" UC={self.upshift_cap:.2f} PT={self.upshift_post_target_speed:.0f}"
       f" SD={int(self.upshift_shift_detected)} AE={CS.aEgo:.2f}"
