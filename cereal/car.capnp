@@ -238,6 +238,7 @@ struct CarState {
   totalDistance @53 : Float32;
   speedLimit @54 : Int32;
   speedLimitDistance @55 : Float32;
+  currentGear @56 : Int32; # actual transmission gear (1..8) when available, 0=unknown
 
   struct Tpms {
     fl @0 :Float32;
