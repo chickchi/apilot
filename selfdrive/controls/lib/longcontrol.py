@@ -99,6 +99,9 @@ class LongControl:
     self.upshift_rpm_threshold = 0.0
     self.upshift_shift_detected = False
     self.upshift_limit_active = False
+    self.upshift_high_rpm_timer = 0.0
+    self.upshift_post_target_speed = 0.0
+    self.upshift_entry_gear = 0
 
     self.longitudinalActuatorDelayLowerBound = float(int(Params().get("LongitudinalActuatorDelayLowerBound", encoding="utf8"))) * 0.01
     self.longitudinalActuatorDelayUpperBound = float(int(Params().get("LongitudinalActuatorDelayUpperBound", encoding="utf8"))) * 0.01
@@ -117,8 +120,11 @@ class LongControl:
     self.upshift_cap = 0.0
     self.upshift_shift_detected = False
     self.upshift_limit_active = False
+    self.upshift_high_rpm_timer = 0.0
+    self.upshift_post_target_speed = 0.0
+    self.upshift_entry_gear = 0
 
-  def update(self, active, CS, long_plan, accel_limits, t_since_plan, CC):
+  def update(self, active, CS, long_plan, accel_limits, t_since_plan, CC, v_cruise_kph_apply):
     self.readParamCount += 1
     if self.readParamCount >= 100:
       self.readParamCount = 0
@@ -322,13 +328,18 @@ class LongControl:
 
     v_ego_kph = CS.vEgo * 3.6
 
-    # Use the far end of the planner speed trajectory for the recovery gap.
-    # self.v_pid is only the *immediate* target and is often very close to
-    # vEgo even when the planner is clearly recovering toward a much higher
-    # cruise speed.  The future-plan gap is a much better trigger signal.
-    v_plan_future = speeds[-1] if len(speeds) == CONTROL_N else self.v_pid
-    dv_kph = (v_plan_future - CS.vEgo) * 3.6
+    # v1.5.1: use the ACTUAL applied cruise target, not speeds[-1].
+    # long_plan.speeds only spans the next ~2.5 s, so its final point usually
+    # understates a recovery such as 84 -> 100 km/h and can prevent U=1.
+    cruise_target_kph = float(v_cruise_kph_apply)
+    cruise_target_valid = 1.0 <= cruise_target_kph <= 200.0
+    if not cruise_target_valid:
+      cruise_target_kph = v_ego_kph
+    dv_kph = max(cruise_target_kph - v_ego_kph, 0.0)
+
     engine_rpm = float(CS.engineRpm)
+    current_gear = int(CS.currentGear)
+    gear_valid = 1 <= current_gear <= 8
 
     # Speed-dependent high-RPM evidence.  This is not a gear detector.
     self.upshift_rpm_threshold = interp(
@@ -341,11 +352,17 @@ class LongControl:
     rpm_valid = engine_rpm > 700.0
     high_rpm = rpm_valid and engine_rpm >= self.upshift_rpm_threshold
 
+    # Real TCU gear is preferred when available.  If the platform cannot
+    # publish a verified numeric gear, retain the RPM-based fallback.
+    lower_gear_candidate = (current_gear in (4, 5)) if gear_valid else True
+
     # Simple grade/load guard: do not request an upshift when the car is not
     # actually accelerating under the current positive command.
     accel_response_ok = CS.aEgo > 0.08
 
-    trigger_window = (
+    # v1.5.1 high-RPM debounce: require ~0.18 s of continuous evidence before
+    # entering U=1, avoiding a transient RPM spike or shift flare trigger.
+    debounce_context = (
       self.long_control_state == LongCtrlState.pid and
       not driver_override and
       self.upshift_state == 0 and
@@ -355,6 +372,16 @@ class LongControl:
       output_accel >= 0.28 and
       accel_response_ok and
       high_rpm and
+      lower_gear_candidate
+    )
+    if debounce_context:
+      self.upshift_high_rpm_timer = min(self.upshift_high_rpm_timer + DT_CTRL, 0.50)
+    else:
+      self.upshift_high_rpm_timer = 0.0
+
+    trigger_window = (
+      debounce_context and
+      self.upshift_high_rpm_timer >= 0.18 and
       (self.upshift_recent_decel > 0.0 or engine_rpm >= self.upshift_rpm_threshold + 250.0)
     )
 
@@ -365,6 +392,10 @@ class LongControl:
       self.upshift_entry_rpm = engine_rpm
       self.upshift_peak_rpm = engine_rpm
       self.upshift_entry_speed = v_ego_kph
+      self.upshift_entry_gear = current_gear if gear_valid else 0
+      # Hold post-shift low load toward ~95 km/h for a 100 km/h recovery.
+      # For lower cruise targets, naturally shorten the hold window.
+      self.upshift_post_target_speed = min(95.0, max(v_ego_kph + 5.0, cruise_target_kph - 4.0))
       self.upshift_shift_detected = False
 
     # Abort on driver intervention, braking demand, a new slowdown, invalid
@@ -405,14 +436,19 @@ class LongControl:
       output_accel = min(output_accel, self.upshift_cap)
       self.upshift_limit_active = True
 
-      # RPM drop while road speed is held is evidence of an upshift.
+      # Prefer verified TCU gear.  This distinguishes 4->5 from 5->6.
+      # With unknown gear, retain the original RPM-drop fallback.
       rpm_drop = self.upshift_peak_rpm - engine_rpm
       speed_held = v_ego_kph >= self.upshift_entry_speed - 0.8
-      if self.upshift_timer >= 0.20 and rpm_drop >= 300.0 and speed_held:
+      reached_top_gear = gear_valid and current_gear >= 6
+      rpm_shift_fallback = (not gear_valid) and self.upshift_timer >= 0.20 and rpm_drop >= 300.0 and speed_held
+      if reached_top_gear or rpm_shift_fallback:
         self.upshift_shift_detected = True
         self.upshift_state = 2
         self.upshift_timer = 0.0
       elif self.upshift_timer >= 1.10:
+        # If entry was 4th and the TCU only moved to 5th, U=2 continues the
+        # low-load window long enough to allow the subsequent 5->6 upshift.
         self.upshift_state = 2
         self.upshift_timer = 0.0
 
@@ -430,12 +466,24 @@ class LongControl:
       output_accel = min(output_accel, self.upshift_cap)
       self.upshift_limit_active = True
 
+      # Update shift evidence during U=2 as well.  A 4->5 first step is not
+      # mistaken for the final 5->6 when real gear telemetry is available.
+      if gear_valid and current_gear >= 6:
+        self.upshift_shift_detected = True
+      elif not gear_valid and (self.upshift_peak_rpm - engine_rpm) >= 300.0:
+        self.upshift_shift_detected = True
+
       # If reduced torque no longer produces forward acceleration, exit early
       # instead of lugging the engine on an uphill/load condition.
       weak_response = self.upshift_timer > 0.45 and CS.aEgo < 0.02 and dv_kph > 5.0
-      post_duration = 2.20 if self.upshift_shift_detected else 1.35
 
-      if weak_response or self.upshift_timer >= post_duration or dv_kph < 3.0 or v_ego_kph >= 97.0:
+      # v1.5.1: no fixed 1.35/2.20 s expiry.  Hold low load until roughly
+      # 94-95 km/h (for a 100 target), or until the target is almost reached.
+      # A 10 s hard timeout is only a safety backstop.
+      post_target_reached = v_ego_kph >= self.upshift_post_target_speed or dv_kph < 3.0
+      hard_timeout = self.upshift_timer >= 10.0
+
+      if weak_response or post_target_reached or hard_timeout or v_ego_kph >= 98.0:
         self.upshift_state = 3
         self.upshift_timer = 0.0
         self.upshift_cooldown = 4.0
@@ -444,21 +492,17 @@ class LongControl:
     self.last_output_accel = clip(output_accel, accel_limits[0], accel_limits[1])
     self.pos_accel_cut = max(self.raw_output_accel - self.last_output_accel, 0.0)
 
-    # Compact v1.5 debug:
-    # E=speed error, AT=planner accel, R=raw PID, PC=v1.4 comfort cap,
-    # J=v1.3 rise limit, O=final accel, C=total cut,
-    # U=upshift state 0/1/2/3, UC=upshift cap,
-    # RPM=engine rpm, RT=rpm trigger threshold, DV=target gap km/h,
-    # SD=RPM-drop shift detected, AE=measured accel.
+    # Compact v1.5.1 debug.  G=0 means numeric gear is unavailable and the
+    # RPM fallback is being used.  HD is the high-RPM debounce timer.
     self.debugLoCText = (
-      f"LC E={self.v_pid - CS.vEgo:+.2f}"
-      f" AT={a_target:.2f} R={self.raw_output_accel:.2f}"
-      f" PC={self.pos_accel_comfort_cap:.2f} J={self.pos_accel_jerk_limit:.2f}"
-      f" O={self.last_output_accel:.2f} C={self.pos_accel_cut:.2f}"
-      f" U={self.upshift_state} UC={self.upshift_cap:.2f}"
-      f" RPM={int(CS.engineRpm)} RT={int(self.upshift_rpm_threshold)}"
-      f" DV={dv_kph:.1f} SD={int(self.upshift_shift_detected)}"
-      f" AE={CS.aEgo:.2f}"
+      f"LC R={self.raw_output_accel:.2f} PC={self.pos_accel_comfort_cap:.2f}"
+      f" J={self.pos_accel_jerk_limit:.2f} O={self.last_output_accel:.2f}"
+      f" U={self.upshift_state} G={current_gear}"
+      f" RPM={int(CS.engineRpm)}/{int(self.upshift_rpm_threshold)}"
+      f" HD={self.upshift_high_rpm_timer:.2f}"
+      f" CT={cruise_target_kph:.0f} DV={dv_kph:.1f}"
+      f" UC={self.upshift_cap:.2f} PT={self.upshift_post_target_speed:.0f}"
+      f" SD={int(self.upshift_shift_detected)} AE={CS.aEgo:.2f}"
     )
 
     return self.last_output_accel, -0.5 if planned_stop else j_target
