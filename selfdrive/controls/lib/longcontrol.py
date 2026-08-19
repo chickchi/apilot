@@ -85,6 +85,21 @@ class LongControl:
     self.pos_accel_jerk_limited = False
     self.pos_accel_headroom_limited = False
 
+    # v1.5 adaptive upshift assist
+    # 0=idle, 1=soft-release/hold, 2=post-shift low-load, 3=cooldown
+    self.upshift_state = 0
+    self.upshift_timer = 0.0
+    self.upshift_cooldown = 0.0
+    self.upshift_recent_decel = 0.0
+    self.upshift_entry_output = 0.0
+    self.upshift_entry_rpm = 0.0
+    self.upshift_peak_rpm = 0.0
+    self.upshift_entry_speed = 0.0
+    self.upshift_cap = 0.0
+    self.upshift_rpm_threshold = 0.0
+    self.upshift_shift_detected = False
+    self.upshift_limit_active = False
+
     self.longitudinalActuatorDelayLowerBound = float(int(Params().get("LongitudinalActuatorDelayLowerBound", encoding="utf8"))) * 0.01
     self.longitudinalActuatorDelayUpperBound = float(int(Params().get("LongitudinalActuatorDelayUpperBound", encoding="utf8"))) * 0.01
 
@@ -92,6 +107,16 @@ class LongControl:
     """Reset PID controller and change setpoint"""
     self.pid.reset()
     self.v_pid = v_pid
+
+    # Cancel any incomplete upshift-assist cycle when longitudinal control
+    # itself is reset (OFF/stopping/starting transition).
+    self.upshift_state = 0
+    self.upshift_timer = 0.0
+    self.upshift_cooldown = 0.0
+    self.upshift_recent_decel = 0.0
+    self.upshift_cap = 0.0
+    self.upshift_shift_detected = False
+    self.upshift_limit_active = False
 
   def update(self, active, CS, long_plan, accel_limits, t_since_plan, CC):
     self.readParamCount += 1
@@ -270,31 +295,169 @@ class LongControl:
       self.pos_accel_headroom_limited = self.pos_accel_comfort_cap + eps < raw_positive and self.pos_accel_comfort_cap <= positive_rise_max + eps
       self.pos_accel_limited = output_accel + eps < raw_positive
 
+    # ----------------------------------------------------------------------
+    # v1.5 Adaptive Upshift Assist
+    #
+    # Reproduces a driver's brief accelerator lift to encourage a natural
+    # 5->6 (or 4->5->6) upshift during recovery from a slowdown.
+    #
+    # No gear is commanded and no fixed RPM is targeted.  Hyundai's TCU keeps
+    # full authority over gear selection; this code only creates a short,
+    # carefully-gated low-load window.
+    # ----------------------------------------------------------------------
+    self.upshift_limit_active = False
+    self.upshift_cap = 0.0
+
+    if self.upshift_cooldown > 0.0:
+      self.upshift_cooldown = max(self.upshift_cooldown - DT_CTRL, 0.0)
+      if self.upshift_cooldown <= 0.0 and self.upshift_state == 3:
+        self.upshift_state = 0
+
+    # Remember a meaningful slowdown for several seconds so the assist is
+    # focused on "decelerate -> recover" events rather than normal cruising.
+    if self.long_control_state == LongCtrlState.pid and (CS.aEgo < -0.12 or self.raw_output_accel < -0.08):
+      self.upshift_recent_decel = 8.0
+    elif self.upshift_recent_decel > 0.0:
+      self.upshift_recent_decel = max(self.upshift_recent_decel - DT_CTRL, 0.0)
+
+    v_ego_kph = CS.vEgo * 3.6
+
+    # Use the far end of the planner speed trajectory for the recovery gap.
+    # self.v_pid is only the *immediate* target and is often very close to
+    # vEgo even when the planner is clearly recovering toward a much higher
+    # cruise speed.  The future-plan gap is a much better trigger signal.
+    v_plan_future = speeds[-1] if len(speeds) == CONTROL_N else self.v_pid
+    dv_kph = (v_plan_future - CS.vEgo) * 3.6
+    engine_rpm = float(CS.engineRpm)
+
+    # Speed-dependent high-RPM evidence.  This is not a gear detector.
+    self.upshift_rpm_threshold = interp(
+      v_ego_kph,
+      [78.0, 82.0, 85.0, 88.0, 92.0, 96.0],
+      [2400.0, 2450.0, 2500.0, 2580.0, 2680.0, 2820.0],
+    )
+
+    driver_override = CS.gasPressed or CS.brakePressed
+    rpm_valid = engine_rpm > 700.0
+    high_rpm = rpm_valid and engine_rpm >= self.upshift_rpm_threshold
+
+    # Simple grade/load guard: do not request an upshift when the car is not
+    # actually accelerating under the current positive command.
+    accel_response_ok = CS.aEgo > 0.08
+
+    trigger_window = (
+      self.long_control_state == LongCtrlState.pid and
+      not driver_override and
+      self.upshift_state == 0 and
+      self.upshift_cooldown <= 0.0 and
+      82.0 <= v_ego_kph <= 92.0 and
+      4.0 <= dv_kph <= 22.0 and
+      output_accel >= 0.28 and
+      accel_response_ok and
+      high_rpm and
+      (self.upshift_recent_decel > 0.0 or engine_rpm >= self.upshift_rpm_threshold + 250.0)
+    )
+
+    if trigger_window:
+      self.upshift_state = 1
+      self.upshift_timer = 0.0
+      self.upshift_entry_output = max(output_accel, 0.0)
+      self.upshift_entry_rpm = engine_rpm
+      self.upshift_peak_rpm = engine_rpm
+      self.upshift_entry_speed = v_ego_kph
+      self.upshift_shift_detected = False
+
+    # Abort on driver intervention, braking demand, a new slowdown, invalid
+    # RPM telemetry, or leaving the useful recovery region.
+    abort_assist = (
+      self.upshift_state in (1, 2) and (
+        driver_override or
+        self.long_control_state != LongCtrlState.pid or
+        self.raw_output_accel <= 0.0 or
+        not rpm_valid or
+        v_ego_kph < 78.0 or
+        v_ego_kph > 98.0 or
+        dv_kph < 1.5 or
+        CS.aEgo < -0.18
+      )
+    )
+
+    if abort_assist:
+      self.upshift_state = 3
+      self.upshift_timer = 0.0
+      self.upshift_cooldown = 2.0
+      self.upshift_cap = 0.0
+
+    elif self.upshift_state == 1:
+      self.upshift_timer += DT_CTRL
+      self.upshift_peak_rpm = max(self.upshift_peak_rpm, engine_rpm)
+
+      # Smoothly lift toward a low positive request rather than dropping the
+      # accel command abruptly.
+      relief_target = interp(
+        v_ego_kph,
+        [80.0, 85.0, 90.0, 95.0],
+        [0.22, 0.20, 0.18, 0.16],
+      )
+      release_ramp_time = 0.35
+      release_progress = min(self.upshift_timer / release_ramp_time, 1.0)
+      self.upshift_cap = self.upshift_entry_output + (relief_target - self.upshift_entry_output) * release_progress
+      output_accel = min(output_accel, self.upshift_cap)
+      self.upshift_limit_active = True
+
+      # RPM drop while road speed is held is evidence of an upshift.
+      rpm_drop = self.upshift_peak_rpm - engine_rpm
+      speed_held = v_ego_kph >= self.upshift_entry_speed - 0.8
+      if self.upshift_timer >= 0.20 and rpm_drop >= 300.0 and speed_held:
+        self.upshift_shift_detected = True
+        self.upshift_state = 2
+        self.upshift_timer = 0.0
+      elif self.upshift_timer >= 1.10:
+        self.upshift_state = 2
+        self.upshift_timer = 0.0
+
+    elif self.upshift_state == 2:
+      self.upshift_timer += DT_CTRL
+
+      # Briefly keep load moderate after the likely upshift so the TCU is less
+      # likely to kick back down immediately.
+      post_cap = interp(
+        v_ego_kph,
+        [80.0, 85.0, 90.0, 95.0, 100.0],
+        [0.34, 0.32, 0.30, 0.27, 0.24],
+      )
+      self.upshift_cap = min(post_cap, self.pos_accel_comfort_cap if self.pos_accel_comfort_cap > 0.0 else post_cap)
+      output_accel = min(output_accel, self.upshift_cap)
+      self.upshift_limit_active = True
+
+      # If reduced torque no longer produces forward acceleration, exit early
+      # instead of lugging the engine on an uphill/load condition.
+      weak_response = self.upshift_timer > 0.45 and CS.aEgo < 0.02 and dv_kph > 5.0
+      post_duration = 2.20 if self.upshift_shift_detected else 1.35
+
+      if weak_response or self.upshift_timer >= post_duration or dv_kph < 3.0 or v_ego_kph >= 97.0:
+        self.upshift_state = 3
+        self.upshift_timer = 0.0
+        self.upshift_cooldown = 4.0
+        self.upshift_cap = 0.0
+
     self.last_output_accel = clip(output_accel, accel_limits[0], accel_limits[1])
     self.pos_accel_cut = max(self.raw_output_accel - self.last_output_accel, 0.0)
 
-    # Compact v1.4 debug:
-    # E   : raw speed error [m/s]
-    # AT  : actuator-delay adjusted planner accel used as PID feed-forward
-    # P/I/F: PID contributions
-    # R   : raw PID output
-    # H   : allowed positive PID headroom above planner [m/s^2]
-    # PC  : planner comfort cap = max(AT, 0) + H
-    # J   : allowed positive rise rate [m/s^3]
-    # O   : final accel command sent downstream
-    # C   : amount removed from raw PID output
-    # HL  : headroom cap is the active limiting ceiling
-    # JL  : J+ slew ceiling is the active limiting ceiling
-    # AE  : measured vehicle acceleration
+    # Compact v1.5 debug:
+    # E=speed error, AT=planner accel, R=raw PID, PC=v1.4 comfort cap,
+    # J=v1.3 rise limit, O=final accel, C=total cut,
+    # U=upshift state 0/1/2/3, UC=upshift cap,
+    # RPM=engine rpm, RT=rpm trigger threshold, DV=target gap km/h,
+    # SD=RPM-drop shift detected, AE=measured accel.
     self.debugLoCText = (
       f"LC E={self.v_pid - CS.vEgo:+.2f}"
-      f" AT={a_target:.2f}"
-      f" P={self.pid.p:.2f} I={self.pid.i:.2f} F={self.pid.f:.2f}"
-      f" R={self.raw_output_accel:.2f}"
-      f" H={self.pos_accel_headroom:.2f} PC={self.pos_accel_comfort_cap:.2f}"
-      f" J={self.pos_accel_jerk_limit:.2f} O={self.last_output_accel:.2f}"
-      f" C={self.pos_accel_cut:.2f}"
-      f" HL={int(self.pos_accel_headroom_limited)} JL={int(self.pos_accel_jerk_limited)}"
+      f" AT={a_target:.2f} R={self.raw_output_accel:.2f}"
+      f" PC={self.pos_accel_comfort_cap:.2f} J={self.pos_accel_jerk_limit:.2f}"
+      f" O={self.last_output_accel:.2f} C={self.pos_accel_cut:.2f}"
+      f" U={self.upshift_state} UC={self.upshift_cap:.2f}"
+      f" RPM={int(CS.engineRpm)} RT={int(self.upshift_rpm_threshold)}"
+      f" DV={dv_kph:.1f} SD={int(self.upshift_shift_detected)}"
       f" AE={CS.aEgo:.2f}"
     )
 
