@@ -70,6 +70,8 @@ class CarState(CarStateBase):
 
     ret = car.CarState.new_message()
     ret.currentGear = 0  # 0=unknown; populated below when TCU12.CUR_GR is available
+    ret.tcuRpm = 0.0
+    ret.targetGear = 0
     cp_cruise = cp_cam if self.CP.sccBus == 2 or self.CP.carFingerprint in CAMERA_SCC_CAR else cp
     self.is_metric = cp.vl["CLU11"]["CF_Clu_SPEED_UNIT"] == 0
     speed_conv = CV.KPH_TO_MS if self.is_metric else CV.MPH_TO_MS
@@ -177,10 +179,16 @@ class CarState(CarStateBase):
       gear = cp.vl["CLU15"]["CF_Clu_Gear"]
     elif self.CP.carFingerprint in FEATURES["use_tcu_gears"]:
       gear = cp.vl["TCU12"]["CUR_GR"]
-      # DBC CUR_GR is the real transmission ratio number (1..8).
-      # Keep gearShifter=D for compatibility, but also publish the actual gear.
+      tcu_rpm = float(cp.vl["TCU12"]["N_TC_RAW"])
+      target_gear = int(cp.vl["TCU13"]["CF_Tcu_TarGr"])
+      # CUR_GR is primary control evidence. N_TC_RAW and targetGear are
+      # separate telemetry; targetGear is observation-only in v1.5.2.
       if 1 <= int(gear) <= 8:
         ret.currentGear = int(gear)
+      if tcu_rpm > 0.0:
+        ret.tcuRpm = tcu_rpm
+      if 1 <= target_gear <= 8:
+        ret.targetGear = target_gear
     elif self.CP.carFingerprint in FEATURES["use_elect_gears"]:
       gear = cp.vl["ELECT_GEAR"]["Elect_Gear_Shifter"]
       if self.CP.carFingerprint in (CAR.NEXO):
@@ -376,6 +384,8 @@ class CarState(CarStateBase):
     # Current CAN-FD parser exposes selector state, not a verified 1..N gear ratio.
     # Leave 0 so LongControl falls back to RPM-based shift detection.
     ret.currentGear = 0
+    ret.tcuRpm = 0.0
+    ret.targetGear = 0
 
     if self.CP.carFingerprint in (EV_CAR | HYBRID_CAR):
       if self.CP.carFingerprint in EV_CAR:
@@ -588,8 +598,13 @@ class CarState(CarStateBase):
     if CP.carFingerprint in FEATURES["use_cluster_gears"]:
       signals.append(("CF_Clu_Gear", "CLU15"))
     elif CP.carFingerprint in FEATURES["use_tcu_gears"]:
-      signals.append(("CUR_GR", "TCU12"))
+      signals += [
+        ("CUR_GR", "TCU12"),
+        ("N_TC_RAW", "TCU12"),
+        ("CF_Tcu_TarGr", "TCU13"),
+      ]
       checks.append(("TCU12", 100))
+      # TCU13 is diagnostic-only for now; do not require it for CAN validity.
     elif CP.carFingerprint in FEATURES["use_elect_gears"]:
       signals.append(("Elect_Gear_Shifter", "ELECT_GEAR"))
       signals.append(("Elect_Motor_Speed", "ELECT_GEAR"))
