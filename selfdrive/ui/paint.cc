@@ -1,4 +1,4 @@
-﻿#include "selfdrive/ui/paint.h"
+#include "selfdrive/ui/paint.h"
 
 #include <cassert>
 #include <cmath>
@@ -1331,22 +1331,21 @@ void DrawApilot::drawLeadApilot(const UIState* s) {
         ui_draw_text(s, x + dx + 20, y + 160, "ACC", 25, COLOR_WHITE, BOLD);
     }
 
-    // RPM표시
+    // RPM표시 - v1.5.3: engineRpm이 없으면 TCU12.N_TC_RAW 사용
     float engineRpm = car_state.getEngineRpm();
+    float tcuRpm = car_state.getTcuRpm();
     float motorRpm = car_state.getMotorRpm();
+    float displayRpm = (engineRpm > 700.0f) ? engineRpm : ((tcuRpm > 700.0f) ? tcuRpm : motorRpm);
 #ifdef __TEST
     static float engineRpm1 = 0.0;
     engineRpm1 += 100.0;
     if (engineRpm1 > 4000.0) engineRpm1 = 0.0;
-    motorRpm = engineRpm1;
+    displayRpm = engineRpm1;
 #endif
     if (s->show_accel > 1) {
         dx += 60;
-        //str.sprintf("%s: %.0f CHARGE: %.0f%%", (motorRpm > 0.0) ? "MOTOR" : "RPM", (motorRpm > 0.0) ? motorRpm : engineRpm, car_state.getChargeMeter());
-        //drawTextWithColor(p, width() - 350, 80, str, textColor);
-        //painter.setPen(Qt::NoPen);
         ui_draw_rect(s->vg, { x + dx, y + 5, 40, 128 }, COLOR_WHITE, 4, 0);
-        ui_fill_rect(s->vg, { x + dx + 2, y + 128 + 5, 36, -(int)(std::clamp((float)engineRpm>0.0?engineRpm:motorRpm, 0.0f, 4000.0f) / 4000. * 128.0) }, (engineRpm> 0.0) ? COLOR_BLUE : COLOR_GREEN, 0);
+        ui_fill_rect(s->vg, { x + dx + 2, y + 128 + 5, 36, -(int)(std::clamp(displayRpm, 0.0f, 4000.0f) / 4000. * 128.0) }, (motorRpm > 0.0f && engineRpm <= 700.0f && tcuRpm <= 700.0f) ? COLOR_GREEN : COLOR_BLUE, 0);
         ui_draw_text(s, x + dx + 20, y + 160, "RPM", 25, COLOR_WHITE, BOLD);
     }
     if (s->show_mode == 3) {
@@ -1692,8 +1691,11 @@ void DrawApilot::drawDeviceState(UIState* s, bool show) {
     if (s->fb_w > 1200 && show) {
         ui_draw_text(s, s->fb_w - 20, 35, str, 35, textColor, BOLD);
         float engineRpm = car_state.getEngineRpm();
+        float tcuRpm = car_state.getTcuRpm();
         float motorRpm = car_state.getMotorRpm();
-        sprintf(str, "FPS: %d, %s: %.0f CHARGE: %.0f%%                      ", g_fps, (motorRpm > 0.0) ? "MOTOR" : "RPM", (motorRpm > 0.0) ? motorRpm : engineRpm, car_state.getChargeMeter());
+        float displayRpm = (engineRpm > 700.0f) ? engineRpm : ((tcuRpm > 700.0f) ? tcuRpm : motorRpm);
+        bool showingMotor = (engineRpm <= 700.0f && tcuRpm <= 700.0f && motorRpm > 0.0f);
+        sprintf(str, "FPS: %d, %s: %.0f CHARGE: %.0f%%                      ", g_fps, showingMotor ? "MOTOR" : "RPM", displayRpm, car_state.getChargeMeter());
         ui_draw_text(s, s->fb_w - 20, 90, str, 35, textColor, BOLD);
     }
     qstr = QString::fromStdString(deviceState.getWifiIpAddress().cStr());
