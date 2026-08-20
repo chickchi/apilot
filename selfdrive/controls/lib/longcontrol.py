@@ -85,23 +85,24 @@ class LongControl:
     self.pos_accel_jerk_limited = False
     self.pos_accel_headroom_limited = False
 
-    # v1.5 adaptive upshift assist
-    # 0=idle, 1=soft-release/hold, 2=post-shift low-load, 3=cooldown
+    # v1.5.3 Adaptive TCU Load Manager
+    # 0=NORMAL, 1=PRE_RELIEF, 2=SHIFT, 3=POST_SHIFT, 4=HOLD6, 5=RPM_PROTECT
     self.upshift_state = 0
     self.upshift_timer = 0.0
     self.upshift_cooldown = 0.0
-    self.upshift_recent_decel = 0.0
+    self.upshift_candidate_timer = 0.0
     self.upshift_entry_output = 0.0
-    self.upshift_entry_rpm = 0.0
-    self.upshift_peak_rpm = 0.0
     self.upshift_entry_speed = 0.0
+    self.upshift_entry_gear = 0
+    self.upshift_post_gear = 0
     self.upshift_cap = 0.0
-    self.upshift_rpm_threshold = 0.0
+    self.upshift_soft_rpm = 0.0
+    self.upshift_hard_rpm = 0.0
+    self.upshift_soft_cap = 0.0
+    self.upshift_shift_cap = 0.0
+    self.upshift_protect_cap = 0.0
     self.upshift_shift_detected = False
     self.upshift_limit_active = False
-    self.upshift_high_rpm_timer = 0.0
-    self.upshift_post_target_speed = 0.0
-    self.upshift_entry_gear = 0
 
     self.longitudinalActuatorDelayLowerBound = float(int(Params().get("LongitudinalActuatorDelayLowerBound", encoding="utf8"))) * 0.01
     self.longitudinalActuatorDelayUpperBound = float(int(Params().get("LongitudinalActuatorDelayUpperBound", encoding="utf8"))) * 0.01
@@ -111,18 +112,23 @@ class LongControl:
     self.pid.reset()
     self.v_pid = v_pid
 
-    # Cancel any incomplete upshift-assist cycle when longitudinal control
-    # itself is reset (OFF/stopping/starting transition).
+    # Cancel any incomplete v1.5.3 transmission-load cycle.
     self.upshift_state = 0
     self.upshift_timer = 0.0
     self.upshift_cooldown = 0.0
-    self.upshift_recent_decel = 0.0
+    self.upshift_candidate_timer = 0.0
+    self.upshift_entry_output = 0.0
+    self.upshift_entry_speed = 0.0
+    self.upshift_entry_gear = 0
+    self.upshift_post_gear = 0
     self.upshift_cap = 0.0
+    self.upshift_soft_rpm = 0.0
+    self.upshift_hard_rpm = 0.0
+    self.upshift_soft_cap = 0.0
+    self.upshift_shift_cap = 0.0
+    self.upshift_protect_cap = 0.0
     self.upshift_shift_detected = False
     self.upshift_limit_active = False
-    self.upshift_high_rpm_timer = 0.0
-    self.upshift_post_target_speed = 0.0
-    self.upshift_entry_gear = 0
 
   def update(self, active, CS, long_plan, accel_limits, t_since_plan, CC, v_cruise_kph_apply):
     self.readParamCount += 1
@@ -302,38 +308,22 @@ class LongControl:
       self.pos_accel_limited = output_accel + eps < raw_positive
 
     # ----------------------------------------------------------------------
-    # v1.5 Adaptive Upshift Assist
+    # v1.5.3 Adaptive TCU Load Manager
     #
-    # Reproduces a driver's brief accelerator lift to encourage a natural
-    # 5->6 (or 4->5->6) upshift during recovery from a slowdown.
-    #
-    # No gear is commanded and no fixed RPM is targeted.  Hyundai's TCU keeps
-    # full authority over gear selection; this code only creates a short,
-    # carefully-gated low-load window.
+    # Road-test driven redesign:
+    # - No recent_decel hard gate.
+    # - Uses G(current gear) + TG(TCU target gear) + TR(TCU RPM) together.
+    # - Treats 3->4->5->6 as sequential human-like accelerator eases.
+    # - Can preserve 6th if it is already accelerating the car adequately.
+    # - Never commands a gear; it only reduces positive acceleration load.
+    # - Negative accel/braking is never limited here.
     # ----------------------------------------------------------------------
     self.upshift_limit_active = False
     self.upshift_cap = 0.0
 
-    if self.upshift_cooldown > 0.0:
-      self.upshift_cooldown = max(self.upshift_cooldown - DT_CTRL, 0.0)
-      if self.upshift_cooldown <= 0.0 and self.upshift_state == 3:
-        self.upshift_state = 0
-
-    # Remember a meaningful slowdown for several seconds so the assist is
-    # focused on "decelerate -> recover" events rather than normal cruising.
-    if self.long_control_state == LongCtrlState.pid and (CS.aEgo < -0.12 or self.raw_output_accel < -0.08):
-      self.upshift_recent_decel = 8.0
-    elif self.upshift_recent_decel > 0.0:
-      self.upshift_recent_decel = max(self.upshift_recent_decel - DT_CTRL, 0.0)
-
     v_ego_kph = CS.vEgo * 3.6
-
-    # v1.5.1: use the ACTUAL applied cruise target, not speeds[-1].
-    # long_plan.speeds only spans the next ~2.5 s, so its final point usually
-    # understates a recovery such as 84 -> 100 km/h and can prevent U=1.
     cruise_target_kph = float(v_cruise_kph_apply)
-    cruise_target_valid = 1.0 <= cruise_target_kph <= 200.0
-    if not cruise_target_valid:
+    if not (1.0 <= cruise_target_kph <= 200.0):
       cruise_target_kph = v_ego_kph
     dv_kph = max(cruise_target_kph - v_ego_kph, 0.0)
 
@@ -344,182 +334,319 @@ class LongControl:
     gear_valid = 1 <= current_gear <= 8
     target_gear_valid = 1 <= target_gear <= 8
 
-    # v1.5.2: current gear is primary evidence. RPM is fallback only.
-    # engineRpm remains visible; if it is unavailable, use TCU12.N_TC_RAW.
+    # User's road data: engineRpm is 0, while TCU12.N_TC_RAW follows shift RPM.
     assist_rpm = engine_rpm if engine_rpm > 700.0 else tcu_rpm
     rpm_valid = assist_rpm > 700.0
 
-    self.upshift_rpm_threshold = interp(
-      v_ego_kph,
-      [78.0, 82.0, 85.0, 88.0, 92.0, 96.0],
-      [2400.0, 2450.0, 2500.0, 2580.0, 2680.0, 2820.0],
-    )
-
     driver_override = CS.gasPressed or CS.brakePressed
-    high_rpm = rpm_valid and assist_rpm >= self.upshift_rpm_threshold
-    gear_candidate = gear_valid and current_gear in (4, 5)
-    rpm_fallback_candidate = (not gear_valid) and high_rpm
-    upshift_candidate = gear_candidate or rpm_fallback_candidate
+    positive_control = self.long_control_state == LongCtrlState.pid and output_accel > 0.0
+    base_context = positive_control and not driver_override and dv_kph > 2.5
 
-    # Simple grade/load guard: do not request an upshift when the car is not
-    # actually accelerating under the current positive command.
+    if self.upshift_cooldown > 0.0:
+      self.upshift_cooldown = max(self.upshift_cooldown - DT_CTRL, 0.0)
+
+    # Per-gear comfortable RPM/load envelope derived from the uploaded videos.
+    soft_min_v = 0.0
+    hard_min_v = 0.0
+    soft_rpm_base = 0.0
+    hard_rpm_base = 0.0
+    soft_cap_base = 0.0
+    shift_cap_base = 0.0
+    protect_cap_base = 0.0
+
+    if current_gear == 3:
+      soft_min_v, hard_min_v = 45.0, 42.0
+      soft_rpm_base, hard_rpm_base = 2100.0, 2350.0
+      soft_cap_base, shift_cap_base, protect_cap_base = 0.42, 0.34, 0.46
+    elif current_gear == 4:
+      soft_min_v, hard_min_v = 58.0, 50.0
+      soft_rpm_base, hard_rpm_base = 2250.0, 2500.0
+      soft_cap_base, shift_cap_base, protect_cap_base = 0.36, 0.28, 0.40
+    elif current_gear == 5:
+      # Earlier/lighter 5->6. Successful road video: G5/TR~2360, UC~0.20 -> G6.
+      soft_min_v, hard_min_v = 80.0, 65.0
+      soft_rpm_base, hard_rpm_base = 2150.0, 2350.0
+      soft_cap_base, shift_cap_base, protect_cap_base = 0.30, 0.20, 0.34
+    elif not gear_valid:
+      # Conservative fallback if numeric gear is unavailable.
+      soft_min_v, hard_min_v = 82.0, 78.0
+      soft_rpm_base, hard_rpm_base = 2500.0, 2750.0
+      soft_cap_base, shift_cap_base, protect_cap_base = 0.30, 0.22, 0.34
+
+    # Large target gaps allow a modestly stronger, but still smooth, recovery.
+    demand_rpm_boost = interp(
+      dv_kph,
+      [0.0, 20.0, 40.0, 60.0],
+      [0.0, 0.0, 120.0, 220.0],
+    )
+    demand_cap_boost = interp(
+      dv_kph,
+      [0.0, 20.0, 40.0, 60.0],
+      [0.0, 0.0, 0.03, 0.05],
+    )
+
+    self.upshift_soft_rpm = soft_rpm_base + demand_rpm_boost if soft_rpm_base > 0.0 else 0.0
+    self.upshift_hard_rpm = hard_rpm_base + demand_rpm_boost if hard_rpm_base > 0.0 else 0.0
+    self.upshift_soft_cap = soft_cap_base + demand_cap_boost if soft_cap_base > 0.0 else 0.0
+    self.upshift_shift_cap = shift_cap_base + demand_cap_boost if shift_cap_base > 0.0 else 0.0
+    self.upshift_protect_cap = protect_cap_base + demand_cap_boost if protect_cap_base > 0.0 else 0.0
+
+    tg_up = target_gear_valid and gear_valid and target_gear > current_gear
+    tg_down = target_gear_valid and gear_valid and target_gear < current_gear
+
+    # Do not encourage an upshift on a hill/load condition where the car is
+    # barely responding.  Strong response is required for RPM_PROTECT.
     accel_response_ok = CS.aEgo > 0.08
+    strong_response = CS.aEgo > 0.15
 
-    # v1.5.2 debounce. With valid G=4/5, RPM is not required.
-    # G=5 waits until 84 km/h, matching the desired mid-80s 5->6 behavior.
-    gear_speed_ok = (
-      (current_gear == 4 and 82.0 <= v_ego_kph <= 92.0) or
-      (current_gear == 5 and 84.0 <= v_ego_kph <= 92.0)
-    ) if gear_valid else (82.0 <= v_ego_kph <= 92.0)
+    gear_managed = (current_gear in (3, 4, 5)) if gear_valid else rpm_valid
 
-    debounce_context = (
-      self.long_control_state == LongCtrlState.pid and
-      not driver_override and
-      self.upshift_state == 0 and
-      self.upshift_cooldown <= 0.0 and
-      gear_speed_ok and
-      4.0 <= dv_kph <= 22.0 and
-      output_accel >= 0.28 and
-      accel_response_ok and
-      upshift_candidate
+    soft_rpm_candidate = (
+      base_context and gear_managed and rpm_valid and accel_response_ok and
+      v_ego_kph >= soft_min_v and assist_rpm >= self.upshift_soft_rpm
     )
-    if debounce_context:
-      self.upshift_high_rpm_timer = min(self.upshift_high_rpm_timer + DT_CTRL, 0.50)
-    else:
-      self.upshift_high_rpm_timer = 0.0
-
-    recovery_evidence = (
-      self.upshift_recent_decel > 0.0
-      if gear_valid
-      else (self.upshift_recent_decel > 0.0 or
-            (rpm_valid and assist_rpm >= self.upshift_rpm_threshold + 250.0))
-    )
-    trigger_window = (
-      debounce_context and
-      self.upshift_high_rpm_timer >= 0.18 and
-      recovery_evidence
+    hard_rpm_candidate = (
+      base_context and gear_managed and rpm_valid and accel_response_ok and
+      v_ego_kph >= hard_min_v and assist_rpm >= self.upshift_hard_rpm
     )
 
-    if trigger_window:
-      self.upshift_state = 1
-      self.upshift_timer = 0.0
-      self.upshift_entry_output = max(output_accel, 0.0)
-      self.upshift_entry_rpm = assist_rpm if rpm_valid else 0.0
-      self.upshift_peak_rpm = assist_rpm if rpm_valid else 0.0
-      self.upshift_entry_speed = v_ego_kph
-      self.upshift_entry_gear = current_gear if gear_valid else 0
-      # Hold post-shift low load toward ~95 km/h for a 100 km/h recovery.
-      # For lower cruise targets, naturally shorten the hold window.
-      self.upshift_post_target_speed = min(95.0, max(v_ego_kph + 5.0, cruise_target_kph - 4.0))
-      self.upshift_shift_detected = False
+    # TG>G means the TCU itself wants the higher gear.  A small load reduction
+    # is then more appropriate than waiting to wind the current gear out.
+    tcu_up_candidate = (
+      base_context and gear_valid and current_gear in (3, 4, 5) and tg_up and
+      accel_response_ok and v_ego_kph >= max(hard_min_v, soft_min_v - 4.0) and
+      (not rpm_valid or assist_rpm >= max(self.upshift_soft_rpm - 150.0, 1200.0))
+    )
 
-    # RPM is not mandatory while verified currentGear is available.
-    transmission_evidence_available = gear_valid or rpm_valid
-    abort_assist = (
-      self.upshift_state in (1, 2) and (
+    # TG<G + already high RPM + strong acceleration: reduce load enough to
+    # avoid one more unnecessary kickdown, but do not use the deep SHIFT cap.
+    rpm_protect_candidate = (
+      base_context and gear_valid and current_gear in (3, 4, 5) and tg_down and
+      rpm_valid and strong_response and v_ego_kph >= hard_min_v and
+      assist_rpm >= self.upshift_hard_rpm
+    )
+
+    # Preserve 6th only while it is clearly doing the job and the TCU has not
+    # yet requested a lower gear.  This is deliberately not a gear lock.
+    hold6_candidate = (
+      base_context and gear_valid and current_gear == 6 and
+      78.0 <= v_ego_kph <= 94.0 and 3.0 <= dv_kph <= 25.0 and
+      output_accel > 0.38 and CS.aEgo > 0.08 and
+      (not target_gear_valid or target_gear >= 6)
+    )
+
+    candidate_state = 0
+    if hold6_candidate:
+      candidate_state = 4
+    elif rpm_protect_candidate:
+      candidate_state = 5
+    elif tcu_up_candidate or hard_rpm_candidate:
+      candidate_state = 2
+    elif soft_rpm_candidate:
+      candidate_state = 1
+
+    # Short debounce: enough to reject a one-frame TG/RPM spike, not enough to
+    # reproduce v1.5.2's HD=0.50 but U=0 missed events.
+    if self.upshift_state == 0 and self.upshift_cooldown <= 0.0 and candidate_state != 0:
+      self.upshift_candidate_timer = min(self.upshift_candidate_timer + DT_CTRL, 0.30)
+      debounce_required = 0.10 if candidate_state in (2, 5) else 0.12
+      if self.upshift_candidate_timer >= debounce_required:
+        self.upshift_state = candidate_state
+        self.upshift_timer = 0.0
+        self.upshift_entry_output = max(output_accel, 0.0)
+        self.upshift_entry_speed = v_ego_kph
+        self.upshift_entry_gear = current_gear if gear_valid else 0
+        self.upshift_post_gear = 0
+        self.upshift_shift_detected = False
+        self.upshift_candidate_timer = 0.0
+    elif self.upshift_state == 0:
+      self.upshift_candidate_timer = 0.0
+
+    # Braking/driver intervention always wins.
+    abort_manager = (
+      self.upshift_state != 0 and (
         driver_override or
         self.long_control_state != LongCtrlState.pid or
         self.raw_output_accel <= 0.0 or
-        not transmission_evidence_available or
-        v_ego_kph < 78.0 or
-        v_ego_kph > 98.0 or
-        dv_kph < 1.5 or
-        CS.aEgo < -0.18
+        dv_kph <= 1.5
       )
     )
-
-    if abort_assist:
-      self.upshift_state = 3
+    if abort_manager:
+      self.upshift_state = 0
       self.upshift_timer = 0.0
-      self.upshift_cooldown = 2.0
+      self.upshift_candidate_timer = 0.0
+      self.upshift_cooldown = 0.20
       self.upshift_cap = 0.0
 
-    elif self.upshift_state == 1:
+    gear_increased = (
+      gear_valid and self.upshift_entry_gear > 0 and
+      current_gear > self.upshift_entry_gear
+    )
+    gear_decreased = (
+      gear_valid and self.upshift_entry_gear > 0 and
+      current_gear < self.upshift_entry_gear
+    )
+
+    # M=1 PRE_RELIEF: first, gentle accelerator ease.
+    if self.upshift_state == 1:
       self.upshift_timer += DT_CTRL
-      if rpm_valid:
-        self.upshift_peak_rpm = max(self.upshift_peak_rpm, assist_rpm)
 
-      # Smoothly lift toward a low positive request rather than dropping the
-      # accel command abruptly.
-      relief_target = interp(
-        v_ego_kph,
-        [80.0, 85.0, 90.0, 95.0],
-        [0.22, 0.20, 0.18, 0.16],
-      )
-      release_ramp_time = 0.35
-      release_progress = min(self.upshift_timer / release_ramp_time, 1.0)
-      self.upshift_cap = self.upshift_entry_output + (relief_target - self.upshift_entry_output) * release_progress
-      output_accel = min(output_accel, self.upshift_cap)
-      self.upshift_limit_active = True
-
-      # Prefer verified TCU gear.  This distinguishes 4->5 from 5->6.
-      # With unknown gear, retain the original RPM-drop fallback.
-      rpm_drop = (self.upshift_peak_rpm - assist_rpm) if rpm_valid else 0.0
-      speed_held = v_ego_kph >= self.upshift_entry_speed - 0.8
-      reached_top_gear = gear_valid and current_gear >= 6
-      rpm_shift_fallback = (
-        (not gear_valid) and rpm_valid and
-        self.upshift_timer >= 0.20 and rpm_drop >= 300.0 and speed_held
-      )
-      if reached_top_gear or rpm_shift_fallback:
+      if gear_increased:
+        self.upshift_state = 3
+        self.upshift_timer = 0.0
+        self.upshift_post_gear = current_gear
         self.upshift_shift_detected = True
+        self.upshift_entry_output = max(output_accel, 0.0)
+      elif rpm_protect_candidate:
+        self.upshift_state = 5
+        self.upshift_timer = 0.0
+        self.upshift_entry_output = max(output_accel, 0.0)
+      elif tcu_up_candidate or hard_rpm_candidate:
         self.upshift_state = 2
         self.upshift_timer = 0.0
-      elif self.upshift_timer >= 1.10:
-        # If entry was 4th and the TCU only moved to 5th, U=2 continues the
-        # low-load window long enough to allow the subsequent 5->6 upshift.
-        self.upshift_state = 2
-        self.upshift_timer = 0.0
+        self.upshift_entry_output = max(output_accel, 0.0)
+      else:
+        target_cap = self.upshift_soft_cap
+        release_progress = min(self.upshift_timer / 0.40, 1.0)
+        self.upshift_cap = self.upshift_entry_output + (target_cap - self.upshift_entry_output) * release_progress
+        output_accel = min(output_accel, self.upshift_cap)
+        self.upshift_limit_active = True
 
+        weak_response = self.upshift_timer > 0.50 and CS.aEgo < 0.02 and dv_kph > 5.0
+        rpm_recovered = rpm_valid and self.upshift_timer > 0.30 and assist_rpm < self.upshift_soft_rpm - 140.0
+        if weak_response or rpm_recovered or self.upshift_timer >= 2.0:
+          self.upshift_state = 0
+          self.upshift_timer = 0.0
+          self.upshift_cooldown = 0.50
+
+    # M=2 SHIFT: slightly clearer lift to complete the next upshift.
     elif self.upshift_state == 2:
       self.upshift_timer += DT_CTRL
 
-      # Briefly keep load moderate after the likely upshift so the TCU is less
-      # likely to kick back down immediately.
-      post_cap = interp(
-        v_ego_kph,
-        [80.0, 85.0, 90.0, 95.0, 100.0],
-        [0.34, 0.32, 0.30, 0.27, 0.24],
-      )
-      self.upshift_cap = min(post_cap, self.pos_accel_comfort_cap if self.pos_accel_comfort_cap > 0.0 else post_cap)
+      if gear_increased:
+        self.upshift_state = 3
+        self.upshift_timer = 0.0
+        self.upshift_post_gear = current_gear
+        self.upshift_shift_detected = True
+        self.upshift_entry_output = max(output_accel, 0.0)
+      else:
+        target_cap = self.upshift_shift_cap
+        release_progress = min(self.upshift_timer / 0.30, 1.0)
+        self.upshift_cap = self.upshift_entry_output + (target_cap - self.upshift_entry_output) * release_progress
+        output_accel = min(output_accel, self.upshift_cap)
+        self.upshift_limit_active = True
+
+        weak_response = self.upshift_timer > 0.45 and CS.aEgo < 0.02 and dv_kph > 5.0
+        if weak_response or self.upshift_timer >= 1.50:
+          self.upshift_state = 0
+          self.upshift_timer = 0.0
+          self.upshift_cooldown = 0.60
+
+    # M=5 RPM_PROTECT: high RPM while TCU asks for another downshift.
+    elif self.upshift_state == 5:
+      self.upshift_timer += DT_CTRL
+
+      if gear_decreased:
+        self.upshift_state = 0
+        self.upshift_timer = 0.0
+        self.upshift_cooldown = 0.35
+      elif tcu_up_candidate:
+        self.upshift_state = 2
+        self.upshift_timer = 0.0
+        self.upshift_entry_output = max(output_accel, 0.0)
+      else:
+        target_cap = self.upshift_protect_cap
+        release_progress = min(self.upshift_timer / 0.30, 1.0)
+        self.upshift_cap = self.upshift_entry_output + (target_cap - self.upshift_entry_output) * release_progress
+        output_accel = min(output_accel, self.upshift_cap)
+        self.upshift_limit_active = True
+
+        protect_resolved = (
+          (not tg_down) or
+          (rpm_valid and assist_rpm < self.upshift_hard_rpm - 150.0) or
+          CS.aEgo < 0.05
+        )
+        if (self.upshift_timer > 0.30 and protect_resolved) or self.upshift_timer >= 1.20:
+          self.upshift_state = 0
+          self.upshift_timer = 0.0
+          self.upshift_cooldown = 0.45
+
+    # M=3 POST_SHIFT: brief mechanical settling, no long cooldown.
+    elif self.upshift_state == 3:
+      self.upshift_timer += DT_CTRL
+
+      if gear_valid and current_gear > self.upshift_post_gear > 0:
+        self.upshift_post_gear = current_gear
+        self.upshift_timer = 0.0
+        self.upshift_shift_detected = True
+
+      if current_gear <= 4:
+        post_cap = 0.44 + demand_cap_boost
+        post_duration = 0.70
+      elif current_gear == 5:
+        post_cap = 0.38 + demand_cap_boost
+        post_duration = 0.75
+      else:
+        post_cap = 0.34 + demand_cap_boost
+        post_duration = 1.00
+
+      self.upshift_cap = post_cap
       output_accel = min(output_accel, self.upshift_cap)
       self.upshift_limit_active = True
 
-      # Update shift evidence during U=2 as well.  A 4->5 first step is not
-      # mistaken for the final 5->6 when real gear telemetry is available.
-      if gear_valid and current_gear >= 6:
-        self.upshift_shift_detected = True
-      elif not gear_valid and rpm_valid and (self.upshift_peak_rpm - assist_rpm) >= 300.0:
-        self.upshift_shift_detected = True
-
-      # If reduced torque no longer produces forward acceleration, exit early
-      # instead of lugging the engine on an uphill/load condition.
-      weak_response = self.upshift_timer > 0.45 and CS.aEgo < 0.02 and dv_kph > 5.0
-
-      # v1.5.1: no fixed 1.35/2.20 s expiry.  Hold low load until roughly
-      # 94-95 km/h (for a 100 target), or until the target is almost reached.
-      # A 10 s hard timeout is only a safety backstop.
-      post_target_reached = v_ego_kph >= self.upshift_post_target_speed or dv_kph < 3.0
-      hard_timeout = self.upshift_timer >= 10.0
-
-      if weak_response or post_target_reached or hard_timeout or v_ego_kph >= 98.0:
-        self.upshift_state = 3
+      next_up_ready = (
+        self.upshift_timer >= 0.35 and
+        gear_valid and current_gear in (3, 4, 5) and
+        target_gear_valid and target_gear > current_gear and
+        (not rpm_valid or assist_rpm >= max(self.upshift_soft_rpm - 100.0, 1200.0))
+      )
+      if next_up_ready:
+        self.upshift_state = 2
         self.upshift_timer = 0.0
-        self.upshift_cooldown = 4.0
-        self.upshift_cap = 0.0
+        self.upshift_entry_output = max(output_accel, 0.0)
+        self.upshift_entry_gear = current_gear
+      elif self.upshift_timer >= post_duration:
+        self.upshift_state = 0
+        self.upshift_timer = 0.0
+        self.upshift_cooldown = 0.20
+        self.upshift_entry_gear = current_gear if gear_valid else 0
+
+    # M=4 HOLD6: human-like "don't press deeper if 6th is already pulling".
+    elif self.upshift_state == 4:
+      self.upshift_timer += DT_CTRL
+
+      hold6_cap = interp(
+        dv_kph,
+        [3.0, 15.0, 25.0],
+        [0.35, 0.36, 0.37],
+      )
+      release_progress = min(self.upshift_timer / 0.30, 1.0)
+      self.upshift_cap = self.upshift_entry_output + (hold6_cap - self.upshift_entry_output) * release_progress
+      output_accel = min(output_accel, self.upshift_cap)
+      self.upshift_limit_active = True
+
+      tcu_requests_down = target_gear_valid and target_gear < 6
+      weak_sixth = self.upshift_timer > 0.45 and CS.aEgo < 0.06 and dv_kph > 5.0
+      sixth_done = v_ego_kph >= 94.0 or dv_kph < 6.0
+      sixth_lost = gear_valid and current_gear < 6
+
+      if tcu_requests_down or weak_sixth or sixth_done or sixth_lost or self.upshift_timer >= 5.0:
+        self.upshift_state = 0
+        self.upshift_timer = 0.0
+        self.upshift_cooldown = 0.35
+        self.upshift_entry_gear = current_gear if gear_valid else 0
 
     self.last_output_accel = clip(output_accel, accel_limits[0], accel_limits[1])
     self.pos_accel_cut = max(self.raw_output_accel - self.last_output_accel, 0.0)
 
-    # v1.5.2 debug. TG is observation-only and never commands a shift.
+    # v1.5.3 debug:
+    # M: 0 normal / 1 pre / 2 shift / 3 post / 4 hold6 / 5 protect
     self.debugLoCText = (
-      f"LC R={self.raw_output_accel:.2f} PC={self.pos_accel_comfort_cap:.2f}"
-      f" J={self.pos_accel_jerk_limit:.2f} O={self.last_output_accel:.2f}"
-      f" U={self.upshift_state} G={current_gear} TG={target_gear if target_gear_valid else 0}"
-      f" ER={int(engine_rpm)} TR={int(tcu_rpm)} AR={int(assist_rpm)}"
-      f" RT={int(self.upshift_rpm_threshold)} HD={self.upshift_high_rpm_timer:.2f}"
+      f"LC R={self.raw_output_accel:.2f} O={self.last_output_accel:.2f}"
+      f" M={self.upshift_state} G={current_gear}>{target_gear if target_gear_valid else 0}"
+      f" TR={int(assist_rpm)} S/H={int(self.upshift_soft_rpm)}/{int(self.upshift_hard_rpm)}"
       f" CT={cruise_target_kph:.0f} DV={dv_kph:.1f}"
-      f" UC={self.upshift_cap:.2f} PT={self.upshift_post_target_speed:.0f}"
+      f" C={self.upshift_cap:.2f} T={self.upshift_timer:.2f}"
       f" SD={int(self.upshift_shift_detected)} AE={CS.aEgo:.2f}"
     )
 
