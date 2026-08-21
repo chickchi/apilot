@@ -320,7 +320,7 @@ class LongitudinalMpc:
     for i in range(N):
       self.solver.cost_set(i, 'Zl', Zl)
 
-  def get_cost_multipliers(self, v_lead0, v_lead1):
+  def get_cost_multipliers(self, v_lead0, v_lead1, primary_pullaway=False):
     v_ego = self.x0[1]
     v_ego_bps = [0, 10]
     TFs = [1.2, 1.45, 1.8]
@@ -331,11 +331,16 @@ class LongitudinalMpc:
     j_ego_tf = interp(self.t_follow, TFs, [.8, 1., 1.1]) #가까울수록 작게
     d_zone_tf = interp(self.t_follow, TFs, [1.3, 1., 1.]) # 가까울수록 크게
 
-    # KRKeegan adjustments to improve sluggish acceleration
-    # do not apply to deceleration
+    # KRKeegan adjustments to improve sluggish acceleration.
+    # v1.5.5 forced traffic pull-away uses a gentler floor than the optional
+    # global dynamic-cost mode: responsive enough to start with the lead, but
+    # not so loose that it creates the old catch-up surge.
     j_ego_v_ego = 1
     a_change_v_ego = 1
-    if (v_lead0 - v_ego >= 0) and (v_lead1 - v_ego >= 0):  #상대차량이 현재속도보다 빠르다면...
+    if primary_pullaway and (v_lead0 - v_ego >= 0):
+      j_ego_v_ego = interp(v_ego, [0, 3, 8], [.20, .35, .75])
+      a_change_v_ego = interp(v_ego, [0, 3, 8], [.20, .35, .75])
+    elif (v_lead0 - v_ego >= 0) and (v_lead1 - v_ego >= 0):  #상대차량이 현재속도보다 빠르다면...
       j_ego_v_ego = interp(v_ego, v_ego_bps, [.05, 1.])
       a_change_v_ego = interp(v_ego, v_ego_bps, [.05, 1.])
     # Select the appropriate min/max of the options
@@ -343,11 +348,11 @@ class LongitudinalMpc:
     a_change = min(a_change_tf, a_change_v_ego)
     return (a_change, j_ego, d_zone_tf)
 
-  def set_weights(self, prev_accel_constraint=True, v_lead0=0, v_lead1=0):
+  def set_weights(self, prev_accel_constraint=True, v_lead0=0, v_lead1=0, force_dynamic=False):
     if self.mode == 'acc':
       a_change_cost = A_CHANGE_COST if prev_accel_constraint else 40
-      if self.applyLongDynamicCost:
-        cost_mulitpliers = self.get_cost_multipliers(v_lead0, v_lead1)
+      if self.applyLongDynamicCost or force_dynamic:
+        cost_mulitpliers = self.get_cost_multipliers(v_lead0, v_lead1, primary_pullaway=force_dynamic)
         cost_weights = [X_EGO_OBSTACLE_COST, X_EGO_COST, V_EGO_COST, A_EGO_COST, a_change_cost * cost_mulitpliers[0], J_EGO_COST * cost_mulitpliers[1]]
         constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, DANGER_ZONE_COST * cost_mulitpliers[2]]
       else:
@@ -428,17 +433,47 @@ class LongitudinalMpc:
 
     applyStopDistance = self.stopDistance * (2.0 - self.mySafeModeFactor)
 
+    # v1.5.5 Traffic Comfort: when a real lead starts pulling away in low-speed
+    # traffic, anticipate it in MPC before the physical gap has grown large.
+    # This only relaxes acceleration-change/jerk costs and shifts the virtual
+    # lead obstacle modestly; planner close-cap and normal collision constraints
+    # remain authoritative.
+    low_speed_pullaway0 = (
+      radarstate.leadOne.status and
+      v_ego < 8.5 and
+      radarstate.leadOne.dRel < 30.0 and
+      radarstate.leadOne.vRel > 0.08
+    )
+    low_speed_pullaway1 = (
+      radarstate.leadTwo.status and
+      v_ego < 8.5 and
+      radarstate.leadTwo.dRel < 30.0 and
+      radarstate.leadTwo.vRel > 0.08
+    )
+    force_pullaway_dynamic = low_speed_pullaway0 or low_speed_pullaway1
+
     # To estimate a safe distance from a moving lead, we calculate how much stopping
     # distance that lead needs as a minimum. We can add that to the current distance
     # and then treat that as a stopped car/obstacle at this new distance.
-    lead_0_obstacle = lead_xv_0[:,0] + get_stopped_equivalence_factor(lead_xv_0[:,1], self.x_sol[:,1], self.t_follow, self.stopDistance, krkeegan=self.applyLongDynamicCost)
-    lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(lead_xv_1[:,1], self.x_sol[:,1], self.t_follow, self.stopDistance, krkeegan=self.applyLongDynamicCost)
+    lead_0_obstacle = lead_xv_0[:,0] + get_stopped_equivalence_factor(
+      lead_xv_0[:,1], self.x_sol[:,1], self.t_follow, self.stopDistance,
+      krkeegan=(self.applyLongDynamicCost or low_speed_pullaway0),
+    )
+    lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(
+      lead_xv_1[:,1], self.x_sol[:,1], self.t_follow, self.stopDistance,
+      krkeegan=(self.applyLongDynamicCost or low_speed_pullaway1),
+    )
     self.params[:,0] = MIN_ACCEL if not reset_state else a_ego
     self.params[:,1] = self.max_a if not reset_state else a_ego
 
     v_cruise, stop_x, self.mode = self.update_apilot(controls, carstate, radarstate, model, v_cruise, self.mode)
     self.mode = 'blended' if self.experimentalMode else self.mode
-    self.set_weights(prev_accel_constraint=prev_accel_constraint, v_lead0=lead_xv_0[0,1], v_lead1=lead_xv_1[0,1])
+    self.set_weights(
+      prev_accel_constraint=prev_accel_constraint,
+      v_lead0=lead_xv_0[0,1],
+      v_lead1=lead_xv_1[0,1],
+      force_dynamic=force_pullaway_dynamic,
+    )
 
     # Update in ACC mode or ACC/e2e blend
     if self.mode == 'acc':
