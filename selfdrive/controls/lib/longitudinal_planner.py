@@ -83,6 +83,10 @@ class LongitudinalPlanner:
     self.ld_dbg = 0
     self.drate_dbg = 0.0
     self.cap_dbg = 0.0
+    # v1.5.5 traffic-follow diagnostics
+    self.away_speed_dbg = 0.0
+    self.depart_conf_dbg = 0.0
+    self.base_cap_dbg = 0.0
     self.gear_hold_cap_dbg = 0.0
     self.final_accel_max_dbg = 0.0
 
@@ -181,31 +185,47 @@ class LongitudinalPlanner:
     # lead는 여기서 딱 1번만 읽기
     lead = sm['radarState'].leadOne
 
+    # v1.5.5 Traffic Comfort:
+    # Detect a pulling-away lead early, but do not convert it into a binary
+    # "wait -> full boost" event.  Keep a short confidence score and a
+    # continuous away-speed estimate that the close-cap logic can use.
     lead_departing = False
     d_rate = 0.0
-    
+    d_rate_mps = 0.0
+    away_speed = 0.0
+
     if lead.status:
       d = float(lead.dRel)
-      
-      # d_rate 첫 프레임 튐 방지 (prev_lead_d가 초기값이면 0으로)
+      vr = float(lead.vRel)  # lead - ego, positive = lead pulling away
+
       if self.prev_lead_d > 0.1:
         d_rate = d - self.prev_lead_d
-      else:
-        d_rate = 0.0
+        # d_rate is metres per model frame.  Convert to m/s, but down-weight
+        # it because radar distance derivative is noisier than vRel.
+        d_rate_mps = clip(d_rate / max(DT_MDL, 1e-3), -3.0, 3.0)
       self.prev_lead_d = d
 
-      lead_departing = (v_ego < 3.0) and (d < 35.0) and ((lead.vRel > 0.05) or (d_rate > 0.03))
-      self.ld_dbg = int(lead_departing)
-      self.drate_dbg = float(d_rate)
-      
-      # ✅ score 누적/감쇠 (핵심)
+      away_speed = clip(max(vr, max(d_rate_mps, 0.0) * 0.55), 0.0, 3.0)
+      lead_departing = (
+        v_ego < 8.5 and       # ~30 km/h: traffic/jam domain
+        d < 35.0 and
+        (vr > 0.08 or d_rate_mps > 0.15)
+      )
+
       if lead_departing:
         self.lead_dep_score = min(self.lead_dep_score + 1, 5)
       else:
         self.lead_dep_score = max(self.lead_dep_score - 1, 0)
-      
+
+      # Keep only a short memory for planner acceleration-rise smoothing.
+      # The old 2 s memory + 1.35 cap created a noticeable late surge.
       if self.lead_dep_score >= 2:
-        self.depart_cnt = max(self.depart_cnt, int(2.0 / DT_MDL)) # 1.8~2.5s 취향
+        self.depart_cnt = max(self.depart_cnt, int(0.8 / DT_MDL))
+
+      self.ld_dbg = int(lead_departing)
+      self.drate_dbg = float(d_rate)
+      self.away_speed_dbg = float(away_speed)
+      self.depart_conf_dbg = float(clip(self.lead_dep_score / 3.0, 0.0, 1.0))
 
     else:
       self.prev_lead_d = 0.0
@@ -214,6 +234,9 @@ class LongitudinalPlanner:
       self.ld_dbg = 0
       self.drate_dbg = 0.0
       self.cap_dbg = 0.0
+      self.away_speed_dbg = 0.0
+      self.depart_conf_dbg = 0.0
+      self.base_cap_dbg = 0.0
 
     # 🔧 72~115km/h 저토크 재가속: 6단 유지 / 불필요한 5단 킥다운 억제
     # - lead 유무/거리와 무관하게 적용: 앞차 감속 후 20~30m 거리에서 재가속할 때도 빠지지 않음
@@ -233,32 +256,52 @@ class LongitudinalPlanner:
     if lead.status and (lead.dRel < 8.0 or (v_ego < 10.0 and lead.vRel < -3.0)):
       accel_limits[0] = MIN_ACCEL
     
-    # 2) (add) lead가 가까울 때만 accel_limits[1] 추가로 낮춤
+    # 2) v1.5.5 Traffic Comfort: continuous gap + relative-speed cap.
+    #
+    # Old behavior had a distance-only low cap, then a binary depart boost
+    # to 1.35.  That produced: wait -> gap opens -> surge -> brake.
+    # New behavior starts gently as soon as the lead pulls away, and increases
+    # allowed acceleration continuously with both gap and away speed.
     if lead.status:
       d = float(lead.dRel)
-      vr = float(lead.vRel)  # lead - ego (negative => closing)
+      vr = float(lead.vRel)
 
-      # 가까울수록 가속을 거의 막고, 25m까지 완만히 풀림
-      close_cap = interp(d, [6.0, 12.0, 20.0, 30.0], [0.10, 0.30, 0.75, accel_limits[1]])
-      #12m: 0.30 → 너무 답답하지 않게 “살짝” 가속 허용
-      #20m: 0.75 → gap이 어느 정도면 자연스럽게 따라가기 시작
-      #6m는 그대로 0.10이라 가까울 때 급가속은 계속 막힘
-      #더 부드럽게(보수적으로) 가고 싶으면 12m를 0.25로, 더 반응성을 원하면 0.35~0.40까지.
+      # Safe base envelope when relative speed is near zero.
+      base_close_cap = interp(
+        d,
+        [4.5, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 30.0],
+        [0.06, 0.10, 0.18, 0.28, 0.40, 0.60, 0.80, accel_limits[1]],
+      )
+      close_cap = base_close_cap
+      self.base_cap_dbg = float(base_close_cap)
 
-      # 정체 재출발 보정: 저속 + gap 작고 + 앞차가 멀어지는 중이면 cap을 조금 빨리 풀어줌
-      if v_ego < 10.0 and d < 25.0 and vr > 0.3:
-        # 최소 허용 가속(답답함 방지)
-        close_cap = max(close_cap, 0.50) #default 0.60
-        # 급출발 방지용 상한(차량 취향에 맞게 1.0~1.4 범위 튜닝)
-        close_cap = min(close_cap, 1.05) #default 1.20
-      
-      # 접근(closing)이면 더 보수적으로
-      if vr < -1.0:
-        close_cap = min(close_cap, interp(v_ego, [0.0, 6.0, 15.0], [0.15, 0.25, 0.40]))
-        
-      # depart 부스트 구간에는 close_cap을 조금 완화 (초반 반응성)
-      if self.depart_cnt > 0 and v_ego < 12.0 and d < 35.0:
-        close_cap = max(close_cap, 1.35)   # 1.2~1.5 취향
+      # Pull-away response.  Confidence rises over only a few model frames;
+      # no fixed 1.35 step remains.
+      if v_ego < 8.5 and d < 35.0 and self.away_speed_dbg > 0.0:
+        depart_conf = self.depart_conf_dbg
+        away_bonus = interp(
+          self.away_speed_dbg,
+          [0.0, 0.15, 0.35, 0.70, 1.20, 2.00, 3.00],
+          [0.0, 0.03, 0.10, 0.22, 0.36, 0.52, 0.62],
+        )
+        gap_bonus = interp(
+          d,
+          [4.5, 7.0, 10.0, 14.0, 20.0, 30.0],
+          [0.0, 0.0, 0.04, 0.08, 0.12, 0.18],
+        )
+        pullaway_cap = min(base_close_cap + depart_conf * (away_bonus + gap_bonus), 1.00)
+        close_cap = max(close_cap, pullaway_cap)
+
+      # Start tapering positive acceleration before closing speed becomes
+      # large.  This reduces the late catch-up / strong-brake sawtooth without
+      # touching emergency braking or negative-acceleration safety limits.
+      if vr < -0.15 and d < 30.0:
+        closing_cap = interp(
+          vr,
+          [-3.0, -1.5, -0.7, -0.3, 0.0],
+          [0.08, 0.16, 0.28, 0.42, close_cap],
+        )
+        close_cap = min(close_cap, closing_cap)
 
       self.cap_dbg = float(close_cap)
       accel_limits[1] = min(accel_limits[1], close_cap)
@@ -311,18 +354,26 @@ class LongitudinalPlanner:
     self.a_desired = float(interp(DT_MDL, T_IDXS[:CONTROL_N], self.a_desired_trajectory))
     self.v_desired_filter.x = self.v_desired_filter.x + DT_MDL * (self.a_desired + a_prev) / 2.0
 
-    restart_boost = (self.depart_cnt > 0) and (v_ego < 12.0)
+    # v1.5.5: because the lead pull-away is now detected earlier, a huge
+    # restart acceleration jump is unnecessary.  Keep only a short mild
+    # response assist; LongControl still applies its own positive J+ shaping.
+    restart_boost = (
+      self.depart_cnt > 0 and
+      v_ego < 8.5 and
+      lead.status and
+      self.away_speed_dbg > 0.15
+    )
     j_pos_limit = interp(v_ego,
                          [0.0, 3.0, 8.0, 20.0, 25.0, 30.0],
                          [0.25, 0.35, 0.55, 0.75, 0.60, 0.50])
 
     if restart_boost:
-      j_pos_limit *= 1.9
+      j_pos_limit *= 1.35
 
     a_inc_max = j_pos_limit * DT_MDL
 
     if restart_boost:
-      a_inc_max = max(a_inc_max, 0.22)
+      a_inc_max = max(a_inc_max, 0.06)
 
     if self.a_desired > a_prev:
       self.a_desired = min(self.a_desired, a_prev + a_inc_max)
@@ -372,6 +423,7 @@ class LongitudinalPlanner:
       f" GH={self.gear_hold_cap_dbg:.2f} AM={self.final_accel_max_dbg:.2f}"
       f" AD={self.a_desired:.2f} A0={self.a_desired_trajectory[0]:.2f}"
       f" D={lead.dRel:.1f} VR={lead.vRel:+.2f}"
+      f" CP={self.cap_dbg:.2f} AS={self.away_speed_dbg:.2f} DC={self.depart_conf_dbg:.1f}"
     ) if lead.status else (
       f"PL V={sm['carState'].vEgo*3.6:.1f}"
       f" GH={self.gear_hold_cap_dbg:.2f} AM={self.final_accel_max_dbg:.2f}"
