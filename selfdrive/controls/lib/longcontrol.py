@@ -359,13 +359,14 @@ class LongControl:
       soft_rpm_base, hard_rpm_base = 2100.0, 2350.0
       soft_cap_base, shift_cap_base, protect_cap_base = 0.42, 0.34, 0.46
     elif current_gear == 4:
-      soft_min_v, hard_min_v = 58.0, 50.0
-      soft_rpm_base, hard_rpm_base = 2250.0, 2500.0
-      soft_cap_base, shift_cap_base, protect_cap_base = 0.36, 0.28, 0.40
+      # v1.5.4: earlier but shallower 4->5 preparation.
+      soft_min_v, hard_min_v = 56.0, 50.0
+      soft_rpm_base, hard_rpm_base = 2200.0, 2425.0
+      soft_cap_base, shift_cap_base, protect_cap_base = 0.40, 0.31, 0.42
     elif current_gear == 5:
-      # Earlier/lighter 5->6. Successful road video: G5/TR~2360, UC~0.20 -> G6.
-      soft_min_v, hard_min_v = 80.0, 65.0
-      soft_rpm_base, hard_rpm_base = 2150.0, 2350.0
+      # v1.5.4: earlier 5->6 preparation; M=2 can add a second micro-lift.
+      soft_min_v, hard_min_v = 79.0, 65.0
+      soft_rpm_base, hard_rpm_base = 2100.0, 2300.0
       soft_cap_base, shift_cap_base, protect_cap_base = 0.30, 0.20, 0.34
     elif not gear_valid:
       # Conservative fallback if numeric gear is unavailable.
@@ -374,11 +375,21 @@ class LongControl:
       soft_cap_base, shift_cap_base, protect_cap_base = 0.30, 0.22, 0.34
 
     # Large target gaps allow a modestly stronger, but still smooth, recovery.
-    demand_rpm_boost = interp(
+    demand_rpm_boost_raw = interp(
       dv_kph,
       [0.0, 20.0, 40.0, 60.0],
       [0.0, 0.0, 120.0, 220.0],
     )
+    # v1.5.4: large DV must not make upper gears wind out.
+    if current_gear == 3:
+      demand_rpm_boost = demand_rpm_boost_raw * 0.80
+    elif current_gear == 4:
+      demand_rpm_boost = demand_rpm_boost_raw * 0.35
+    elif current_gear == 5:
+      demand_rpm_boost = 0.0
+    else:
+      demand_rpm_boost = demand_rpm_boost_raw
+
     demand_cap_boost = interp(
       dv_kph,
       [0.0, 20.0, 40.0, 60.0],
@@ -519,7 +530,8 @@ class LongControl:
           self.upshift_timer = 0.0
           self.upshift_cooldown = 0.50
 
-    # M=2 SHIFT: slightly clearer lift to complete the next upshift.
+    # M=2 SHIFT: smooth shift relief.  G5 gets a second human-like micro-lift
+    # if the first ~.20 request does not complete 5->6.
     elif self.upshift_state == 2:
       self.upshift_timer += DT_CTRL
 
@@ -530,17 +542,37 @@ class LongControl:
         self.upshift_shift_detected = True
         self.upshift_entry_output = max(output_accel, 0.0)
       else:
-        target_cap = self.upshift_shift_cap
-        release_progress = min(self.upshift_timer / 0.30, 1.0)
-        self.upshift_cap = self.upshift_entry_output + (target_cap - self.upshift_entry_output) * release_progress
+        if self.upshift_entry_gear == 5:
+          stage_a_cap = self.upshift_shift_cap
+          if self.upshift_timer <= 0.65:
+            release_progress = min(self.upshift_timer / 0.30, 1.0)
+            target_cap = self.upshift_entry_output + (stage_a_cap - self.upshift_entry_output) * release_progress
+          else:
+            micro_cap = min(0.10 + demand_cap_boost * 0.35, stage_a_cap)
+            micro_progress = min((self.upshift_timer - 0.65) / 0.35, 1.0)
+            target_cap = stage_a_cap + (micro_cap - stage_a_cap) * micro_progress
+          shift_timeout = 2.20
+          weak_check_time = 0.95
+        elif self.upshift_entry_gear == 4:
+          release_progress = min(self.upshift_timer / 0.32, 1.0)
+          target_cap = self.upshift_entry_output + (self.upshift_shift_cap - self.upshift_entry_output) * release_progress
+          shift_timeout = 1.35
+          weak_check_time = 0.50
+        else:
+          release_progress = min(self.upshift_timer / 0.30, 1.0)
+          target_cap = self.upshift_entry_output + (self.upshift_shift_cap - self.upshift_entry_output) * release_progress
+          shift_timeout = 1.40
+          weak_check_time = 0.50
+
+        self.upshift_cap = target_cap
         output_accel = min(output_accel, self.upshift_cap)
         self.upshift_limit_active = True
 
-        weak_response = self.upshift_timer > 0.45 and CS.aEgo < 0.02 and dv_kph > 5.0
-        if weak_response or self.upshift_timer >= 1.50:
+        weak_response = self.upshift_timer > weak_check_time and CS.aEgo < 0.01 and dv_kph > 5.0
+        if weak_response or self.upshift_timer >= shift_timeout:
           self.upshift_state = 0
           self.upshift_timer = 0.0
-          self.upshift_cooldown = 0.60
+          self.upshift_cooldown = 0.45 if self.upshift_entry_gear == 5 else 0.50
 
     # M=5 RPM_PROTECT: high RPM while TCU asks for another downshift.
     elif self.upshift_state == 5:
@@ -647,6 +679,7 @@ class LongControl:
       f" TR={int(assist_rpm)} S/H={int(self.upshift_soft_rpm)}/{int(self.upshift_hard_rpm)}"
       f" CT={cruise_target_kph:.0f} DV={dv_kph:.1f}"
       f" C={self.upshift_cap:.2f} T={self.upshift_timer:.2f}"
+      f" ML={int(self.upshift_state == 2 and self.upshift_entry_gear == 5 and self.upshift_timer > 0.65)}"
       f" SD={int(self.upshift_shift_detected)} AE={CS.aEgo:.2f}"
     )
 
