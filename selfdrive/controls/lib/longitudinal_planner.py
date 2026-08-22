@@ -87,6 +87,10 @@ class LongitudinalPlanner:
     self.away_speed_dbg = 0.0
     self.depart_conf_dbg = 0.0
     self.base_cap_dbg = 0.0
+    # v1.5.6 cruise-speed fail-safe diagnostics
+    self.cruise_guard_cap_dbg = 0.0
+    self.cruise_overspeed_dbg = 0.0
+    self.cruise_guard_active_dbg = False
     self.gear_hold_cap_dbg = 0.0
     self.final_accel_max_dbg = 0.0
 
@@ -144,6 +148,10 @@ class LongitudinalPlanner:
     v_ego = sm['carState'].vEgo
     v_cruise_kph = sm['controlsState'].vCruise
     v_cruise_kph = min(v_cruise_kph, V_CRUISE_MAX)
+    # controlsState.vCruise and vEgoCluster are both cluster/display-speed based.
+    # Keep this unscaled pair for the independent cruise overspeed fail-safe.
+    v_cruise_cluster_kph = float(v_cruise_kph)
+    v_ego_cluster_kph = float(sm['carState'].vEgoCluster * CV.MS_TO_KPH)
     v_cruise = v_cruise_kph * CV.KPH_TO_MS
 
     # neokii
@@ -306,6 +314,37 @@ class LongitudinalPlanner:
       self.cap_dbg = float(close_cap)
       accel_limits[1] = min(accel_limits[1], close_cap)
 
+    # ------------------------------------------------------------------
+    # v1.5.6 CRUISE SPEED FAIL-SAFE (planner layer)
+    #
+    # Road-test failure: with CT=90 and no lead (L=0), AD/A0 stayed about
+    # +0.4 even after cluster speed passed 90, eventually accelerating well
+    # beyond the selected cruise speed.  The MPC cruise obstacle is a soft
+    # cost and cannot be the only speed-limit safety mechanism.
+    #
+    # Once cluster speed is >0.5 km/h above the applied cruise target, cap
+    # positive acceleration independently of lead/MPC state.  A larger
+    # overspeed requests only a modest deceleration; stronger negative accel
+    # from normal safety/lead logic remains untouched.
+    # ------------------------------------------------------------------
+    self.cruise_guard_cap_dbg = 0.0
+    self.cruise_overspeed_dbg = 0.0
+    self.cruise_guard_active_dbg = False
+    cruise_target_valid = 1.0 <= v_cruise_cluster_kph <= V_CRUISE_MAX
+    cluster_speed_valid = v_ego_cluster_kph > 0.5
+    cruise_overspeed_kph = v_ego_cluster_kph - v_cruise_cluster_kph
+
+    if (not reset_state) and cruise_target_valid and cluster_speed_valid and cruise_overspeed_kph > 0.5:
+      cruise_guard_cap = interp(
+        cruise_overspeed_kph,
+        [0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0],
+        [0.05, 0.00, -0.05, -0.10, -0.20, -0.35, -0.60],
+      )
+      accel_limits[1] = min(accel_limits[1], cruise_guard_cap)
+      self.cruise_guard_cap_dbg = float(cruise_guard_cap)
+      self.cruise_overspeed_dbg = float(cruise_overspeed_kph)
+      self.cruise_guard_active_dbg = True
+
     # 3) turns 제한은 마지막에 한 번
     accel_limits_turns = limit_accel_in_turns(v_ego, sm['carState'].steeringAngleDeg, accel_limits, self.CP)
 
@@ -326,7 +365,11 @@ class LongitudinalPlanner:
       v_cruise = 0.0
     # clip limits, cannot init MPC outside of bounds
     accel_limits_turns[0] = min(accel_limits_turns[0], self.a_desired + 0.05)
-    accel_limits_turns[1] = max(accel_limits_turns[1], self.a_desired - 0.05)
+    if self.cruise_guard_active_dbg:
+      # Safety cap must never be reopened by the normal a_desired smoothing.
+      accel_limits_turns[1] = min(accel_limits_turns[1], self.cruise_guard_cap_dbg)
+    else:
+      accel_limits_turns[1] = max(accel_limits_turns[1], self.a_desired - 0.05)
 
     # 실제 MPC에 전달되는 최종 acceleration upper limit 기록
     self.final_accel_max_dbg = float(accel_limits_turns[1])
@@ -343,6 +386,12 @@ class LongitudinalPlanner:
     self.v_desired_trajectory = self.v_desired_trajectory_full[:CONTROL_N]
     self.a_desired_trajectory = self.a_desired_trajectory_full[:CONTROL_N]
     self.j_desired_trajectory = np.interp(T_IDXS[:CONTROL_N], T_IDXS_MPC[:-1], self.mpc.j_solution)
+
+    if self.cruise_guard_active_dbg:
+      # Hard safety envelope for the plan sent to LongControl.
+      # v_cruise is already converted to the vehicle-speed domain by vCluRatio.
+      self.v_desired_trajectory = np.minimum(self.v_desired_trajectory, v_cruise)
+      self.a_desired_trajectory = np.minimum(self.a_desired_trajectory, self.cruise_guard_cap_dbg)
 
     # TODO counter is only needed because radar is glitchy, remove once radar is gone
     self.fcw = self.mpc.crash_cnt > 2 and not sm['carState'].standstill and not reset_state
@@ -422,12 +471,14 @@ class LongitudinalPlanner:
       f"PL V={sm['carState'].vEgo*3.6:.1f}"
       f" GH={self.gear_hold_cap_dbg:.2f} AM={self.final_accel_max_dbg:.2f}"
       f" AD={self.a_desired:.2f} A0={self.a_desired_trajectory[0]:.2f}"
+      f" CG={self.cruise_guard_cap_dbg:.2f} OV={self.cruise_overspeed_dbg:.1f}"
       f" D={lead.dRel:.1f} VR={lead.vRel:+.2f}"
       f" CP={self.cap_dbg:.2f} AS={self.away_speed_dbg:.2f} DC={self.depart_conf_dbg:.1f}"
     ) if lead.status else (
       f"PL V={sm['carState'].vEgo*3.6:.1f}"
       f" GH={self.gear_hold_cap_dbg:.2f} AM={self.final_accel_max_dbg:.2f}"
-      f" AD={self.a_desired:.2f} A0={self.a_desired_trajectory[0]:.2f} L=0"
+      f" AD={self.a_desired:.2f} A0={self.a_desired_trajectory[0]:.2f}"
+      f" CG={self.cruise_guard_cap_dbg:.2f} OV={self.cruise_overspeed_dbg:.1f} L=0"
     )
     
     longitudinalPlan.trafficState = self.mpc.trafficState
