@@ -85,6 +85,11 @@ class LongControl:
     self.pos_accel_jerk_limited = False
     self.pos_accel_headroom_limited = False
 
+    # v1.5.6 final cruise-speed fail-safe
+    self.cruise_guard_cap = 0.0
+    self.cruise_overspeed_kph = 0.0
+    self.cruise_guard_active = False
+
     # v1.5.3 Adaptive TCU Load Manager
     # 0=NORMAL, 1=PRE_RELIEF, 2=SHIFT, 3=POST_SHIFT, 4=HOLD6, 5=RPM_PROTECT
     self.upshift_state = 0
@@ -322,10 +327,17 @@ class LongControl:
     self.upshift_cap = 0.0
 
     v_ego_kph = CS.vEgo * 3.6
+    v_ego_cluster_kph = float(CS.vEgoCluster * 3.6)
+    if v_ego_cluster_kph <= 0.5:
+      v_ego_cluster_kph = v_ego_kph
+
     cruise_target_kph = float(v_cruise_kph_apply)
     if not (1.0 <= cruise_target_kph <= 200.0):
-      cruise_target_kph = v_ego_kph
-    dv_kph = max(cruise_target_kph - v_ego_kph, 0.0)
+      cruise_target_kph = v_ego_cluster_kph
+    # v_cruise_kph_apply is cluster/display-speed based, so DV must use
+    # vEgoCluster as well.  The old mixed-domain subtraction made DV stay
+    # positive even around the displayed set speed on this vehicle.
+    dv_kph = max(cruise_target_kph - v_ego_cluster_kph, 0.0)
 
     engine_rpm = float(CS.engineRpm)
     tcu_rpm = float(CS.tcuRpm)
@@ -668,6 +680,32 @@ class LongControl:
         self.upshift_cooldown = 0.35
         self.upshift_entry_gear = current_gear if gear_valid else 0
 
+    # ------------------------------------------------------------------
+    # v1.5.6 CRUISE SPEED FAIL-SAFE (LongControl layer)
+    #
+    # Independent of planner/MPC.  If the displayed vehicle speed exceeds
+    # the applied displayed cruise target, positive acceleration is no longer
+    # allowed to persist.  Driver accelerator override is intentionally left
+    # untouched.
+    # ------------------------------------------------------------------
+    self.cruise_guard_cap = 0.0
+    self.cruise_overspeed_kph = 0.0
+    self.cruise_guard_active = False
+    cruise_overspeed_kph = v_ego_cluster_kph - cruise_target_kph
+    cruise_guard_valid = 1.0 <= cruise_target_kph <= 200.0 and v_ego_cluster_kph > 0.5
+
+    if (self.long_control_state == LongCtrlState.pid and not CS.gasPressed and
+        cruise_guard_valid and cruise_overspeed_kph > 0.5):
+      cruise_guard_cap = interp(
+        cruise_overspeed_kph,
+        [0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0],
+        [0.05, 0.00, -0.05, -0.10, -0.20, -0.35, -0.60],
+      )
+      output_accel = min(output_accel, cruise_guard_cap)
+      self.cruise_guard_cap = float(cruise_guard_cap)
+      self.cruise_overspeed_kph = float(cruise_overspeed_kph)
+      self.cruise_guard_active = True
+
     self.last_output_accel = clip(output_accel, accel_limits[0], accel_limits[1])
     self.pos_accel_cut = max(self.raw_output_accel - self.last_output_accel, 0.0)
 
@@ -678,6 +716,7 @@ class LongControl:
       f" M={self.upshift_state} G={current_gear}>{target_gear if target_gear_valid else 0}"
       f" TR={int(assist_rpm)} S/H={int(self.upshift_soft_rpm)}/{int(self.upshift_hard_rpm)}"
       f" CT={cruise_target_kph:.0f} DV={dv_kph:.1f}"
+      f" CG={self.cruise_guard_cap:.2f} OV={self.cruise_overspeed_kph:.1f}"
       f" C={self.upshift_cap:.2f} T={self.upshift_timer:.2f}"
       f" ML={int(self.upshift_state == 2 and self.upshift_entry_gear == 5 and self.upshift_timer > 0.65)}"
       f" SD={int(self.upshift_shift_detected)} AE={CS.aEgo:.2f}"
