@@ -94,6 +94,25 @@ class CarController:
 
     # accel + longitudinal
     accel = clip(actuators.accel, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX)
+
+    # v1.5.6 hardware-adjacent cruise-speed fail-safe.
+    # hud_control.setSpeed and vEgoCluster are both SI (m/s) here.  This is
+    # deliberately redundant with planner/LongControl so a stale/incorrect
+    # positive request cannot reach Hyundai SCC merely because an upstream
+    # safety layer failed.  Driver accelerator override remains available.
+    cruise_target_ms = float(hud_control.setSpeed)
+    cluster_speed_ms = float(CS.out.vEgoCluster)
+    if (CC.longActive and not CC.cruiseControl.override and not CS.out.gasPressed and
+        cruise_target_ms > 1.0 and cluster_speed_ms > 0.5):
+      cruise_overspeed_kph = (cluster_speed_ms - cruise_target_ms) * CV.MS_TO_KPH
+      if cruise_overspeed_kph > 1.0:
+        controller_guard_cap = interp(
+          cruise_overspeed_kph,
+          [1.0, 2.0, 3.0, 5.0, 10.0, 20.0],
+          [0.00, -0.05, -0.10, -0.20, -0.35, -0.60],
+        )
+        accel = min(accel, controller_guard_cap)
+
     stopping = actuators.longControlState == LongCtrlState.stopping
     set_speed_in_units = hud_control.setSpeed * (CV.MS_TO_KPH if CS.is_metric else CV.MS_TO_MPH)
 
