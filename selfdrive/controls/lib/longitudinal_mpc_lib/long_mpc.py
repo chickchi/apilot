@@ -254,6 +254,13 @@ class LongitudinalMpc:
     self.prev_x = 0
     self.v_ego_kph_prev = 0.0
 
+    # v1.5.8 captured standstill-gap / clear-road state
+    self.restart_gap_capture = 0.0
+    self.restart_gap_timer = 0.0
+    self.restart_gap_active = False
+    self.restart_stop_distance = STOP_DISTANCE
+    self.clear_road_recovery = False
+
     self.t_follow = T_FOLLOW
     self.comfort_brake = COMFORT_BRAKE
     self.xState = XState.cruise
@@ -289,6 +296,11 @@ class LongitudinalMpc:
     self.xState = XState.cruise
     self.startSignCount = 0
     self.stopSignCount = 0
+    self.restart_gap_capture = 0.0
+    self.restart_gap_timer = 0.0
+    self.restart_gap_active = False
+    self.restart_stop_distance = self.stopDistance
+    self.clear_road_recovery = False
 
     for i in range(N+1):
       self.solver.set(i, 'x', np.zeros(X_DIM))
@@ -348,18 +360,35 @@ class LongitudinalMpc:
     a_change = min(a_change_tf, a_change_v_ego)
     return (a_change, j_ego, d_zone_tf)
 
-  def set_weights(self, prev_accel_constraint=True, v_lead0=0, v_lead1=0, force_dynamic=False):
+  def set_weights(self, prev_accel_constraint=True, v_lead0=0, v_lead1=0,
+                  force_dynamic=False, clear_road_recovery=False):
     if self.mode == 'acc':
-      a_change_cost = A_CHANGE_COST if prev_accel_constraint else 40
+      a_change_cost = A_CHANGE_COST if prev_accel_constraint else 40.0
+      j_ego_cost = J_EGO_COST
+      danger_zone_cost = DANGER_ZONE_COST
+
       if self.applyLongDynamicCost or force_dynamic:
-        cost_mulitpliers = self.get_cost_multipliers(v_lead0, v_lead1, primary_pullaway=force_dynamic)
-        cost_weights = [X_EGO_OBSTACLE_COST, X_EGO_COST, V_EGO_COST, A_EGO_COST, a_change_cost * cost_mulitpliers[0], J_EGO_COST * cost_mulitpliers[1]]
-        constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, DANGER_ZONE_COST * cost_mulitpliers[2]]
-      else:
-        cost_weights = [X_EGO_OBSTACLE_COST, X_EGO_COST, V_EGO_COST, A_EGO_COST, a_change_cost, J_EGO_COST]
-        constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, DANGER_ZONE_COST]
+        cost_multipliers = self.get_cost_multipliers(
+          v_lead0, v_lead1, primary_pullaway=force_dynamic)
+        a_change_cost *= cost_multipliers[0]
+        j_ego_cost *= cost_multipliers[1]
+        danger_zone_cost *= cost_multipliers[2]
+
+      # v1.5.8: short post-lane-change / released-lead recovery.
+      # Only comfort costs are relaxed. Obstacle/danger constraints stay intact.
+      if clear_road_recovery:
+        a_change_cost = min(a_change_cost, 75.0)
+        j_ego_cost = min(j_ego_cost, 3.5)
+
+      cost_weights = [
+        X_EGO_OBSTACLE_COST, X_EGO_COST, V_EGO_COST, A_EGO_COST,
+        a_change_cost, j_ego_cost,
+      ]
+      constraint_cost_weights = [
+        LIMIT_COST, LIMIT_COST, LIMIT_COST, danger_zone_cost,
+      ]
     elif self.mode == 'blended':
-      a_change_cost = 40.0 if prev_accel_constraint else 40
+      a_change_cost = 40.0
       cost_weights = [0., 0.1, 0.2, 5.0, a_change_cost, 1.0]
       constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, 50.0]
     else:
@@ -411,7 +440,7 @@ class LongitudinalMpc:
     self.cruise_min_a = min_a
     self.max_a = max_a
 
-  def update(self, carstate, radarstate, model, controls, v_cruise, x, v, a, j, y, prev_accel_constraint, reset_state):
+  def update(self, carstate, radarstate, model, controls, v_cruise, x, v, a, j, y, prev_accel_constraint, reset_state, clear_road_recovery=False):
 
     self.update_params()
     v_ego = self.x0[1]
@@ -431,7 +460,69 @@ class LongitudinalMpc:
     self.comfort_brake = COMFORT_BRAKE
     #self.set_weights(prev_accel_constraint=prev_accel_constraint, v_lead0=lead_xv_0[0,1], v_lead1=lead_xv_1[0,1])
 
-    applyStopDistance = self.stopDistance * (2.0 - self.mySafeModeFactor)
+    baseApplyStopDistance = self.stopDistance * (2.0 - self.mySafeModeFactor)
+    applyStopDistance = baseApplyStopDistance
+    self.clear_road_recovery = bool(clear_road_recovery)
+
+    # ------------------------------------------------------------------
+    # v1.5.8 CAPTURED STANDSTILL GAP
+    # Capture the stable real gap while both cars are stopped. Once that same
+    # lead genuinely departs, temporarily use capture+0.35m (min 4.5m) and
+    # blend back to the normal SafeMode-expanded stop distance over 4 seconds.
+    # A stationary lead never activates this path.
+    # ------------------------------------------------------------------
+    lead0 = radarstate.leadOne
+    standstill_capture = (
+      lead0.status and
+      v_ego < 0.35 and
+      2.5 <= lead0.dRel <= 12.0 and
+      abs(lead0.vRel) < 0.18 and
+      lead0.vLead < 0.35
+    )
+    if standstill_capture:
+      if self.restart_gap_capture <= 0.1:
+        self.restart_gap_capture = float(lead0.dRel)
+      else:
+        self.restart_gap_capture = (
+          0.85 * self.restart_gap_capture + 0.15 * float(lead0.dRel))
+      self.restart_gap_timer = 0.0
+      self.restart_gap_active = False
+
+    genuine_departure = (
+      lead0.status and
+      self.restart_gap_capture > 0.1 and
+      v_ego < 2.0 and
+      lead0.dRel < 30.0 and
+      (lead0.vRel > 0.10 or lead0.vLead > 0.55)
+    )
+    if genuine_departure and not self.restart_gap_active:
+      self.restart_gap_active = True
+      self.restart_gap_timer = 0.0
+
+    if self.restart_gap_active:
+      lead_stopped_again = (
+        (not lead0.status) or
+        (lead0.vLead < 0.25 and lead0.vRel < 0.05 and v_ego < 1.0)
+      )
+      if lead_stopped_again:
+        self.restart_gap_active = False
+        self.restart_gap_timer = 0.0
+      else:
+        self.restart_gap_timer += DT_MDL
+        restart_target = clip(
+          self.restart_gap_capture + 0.35, 4.5, baseApplyStopDistance)
+        restore = clip(self.restart_gap_timer / 4.0, 0.0, 1.0)
+        applyStopDistance = (
+          restart_target +
+          (baseApplyStopDistance - restart_target) * restore
+        )
+        if self.restart_gap_timer >= 4.0 or v_ego > 8.0:
+          self.restart_gap_active = False
+          self.restart_gap_timer = 0.0
+          self.restart_gap_capture = 0.0
+          applyStopDistance = baseApplyStopDistance
+
+    self.restart_stop_distance = float(applyStopDistance)
 
     # v1.5.5 Traffic Comfort: when a real lead starts pulling away in low-speed
     # traffic, anticipate it in MPC before the physical gap has grown large.
@@ -473,6 +564,7 @@ class LongitudinalMpc:
       v_lead0=lead_xv_0[0,1],
       v_lead1=lead_xv_1[0,1],
       force_dynamic=force_pullaway_dynamic,
+      clear_road_recovery=self.clear_road_recovery,
     )
 
     # Update in ACC mode or ACC/e2e blend
@@ -495,7 +587,14 @@ class LongitudinalMpc:
 
       #self.debugLongText1 = 'A{:.2f},Y{:.1f},TR={:.2f},state={} {},L{:3.1f} C{:3.1f},{:3.1f},{:3.1f} X{:3.1f} S{:3.1f},V={:.1f}:{:.1f}:{:.1f}'.format(
       #  self.prev_a[0], y[-1], self.t_follow, self.xState, self.e2ePaused, lead_0_obstacle[0], cruise_obstacle[0], cruise_obstacle[1], cruise_obstacle[-1],model.position.x[-1], model_x, v_ego*3.6, v[0]*3.6, v[-1]*3.6)
-      self.debugLongText1 = "A{:3.2f},L0{:5.1f},C{:5.1f},X{:5.1f},S{:5.1f}".format(self.max_a, lead_0_obstacle[0], cruise_obstacle[0], x2[0], self.stopDist)
+      self.debugLongText1 = (
+        "MPC A{:.2f} L{:.1f} S{:.1f} RS{:.1f} RG{:.1f} RA{} CR{}"
+        .format(
+          self.max_a, lead_0_obstacle[0], self.stopDist,
+          self.restart_stop_distance, self.restart_gap_capture,
+          int(self.restart_gap_active), int(self.clear_road_recovery),
+        )
+      )
 
       self.source = SOURCES[np.argmin(x_obstacles[0])]
 
