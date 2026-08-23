@@ -91,6 +91,15 @@ class LongitudinalPlanner:
     self.cruise_guard_cap_dbg = 0.0
     self.cruise_overspeed_dbg = 0.0
     self.cruise_guard_active_dbg = False
+
+    # v1.5.7 cut-in-aware braking authority
+    self.lead_brake_candidate_timer = 0.0
+    self.brake_authority_dbg = 0.0
+    self.required_decel_dbg = 0.0
+    self.lead_ttc_dbg = 99.0
+    self.lead_speed_dbg = 0.0
+    self.lead_brake_confirmed_dbg = False
+
     self.gear_hold_cap_dbg = 0.0
     self.final_accel_max_dbg = 0.0
 
@@ -260,10 +269,88 @@ class LongitudinalPlanner:
       accel_limits[1] = min(accel_limits[1], gear_hold_cap)
       self.gear_hold_cap_dbg = float(gear_hold_cap)
     
-    # 1-추가) 위험 접근이면 감속 하한만 MIN_ACCEL로 "오픈" (모드 무관)
-    if lead.status and (lead.dRel < 8.0 or (v_ego < 10.0 and lead.vRel < -3.0)):
-      accel_limits[0] = MIN_ACCEL
-    
+    # ------------------------------------------------------------------
+    # v1.5.7 CUT-IN-AWARE DYNAMIC BRAKING AUTHORITY
+    #
+    # Replaces the blanket dRel<8m -> MIN_ACCEL(-4.0) rule.
+    # Benign cut-ins keep normal braking authority. Risky moving cut-ins
+    # are confirmed for ~0.20 s, while very slow/stationary obstacles and
+    # extreme TTC bypass the debounce. This only opens the MPC lower limit;
+    # it does NOT directly command that amount of braking.
+    # ------------------------------------------------------------------
+    self.brake_authority_dbg = abs(float(accel_limits[0]))
+    self.required_decel_dbg = 0.0
+    self.lead_ttc_dbg = 99.0
+    self.lead_speed_dbg = 0.0
+    self.lead_brake_confirmed_dbg = False
+
+    if lead.status:
+      risk_d = max(float(lead.dRel), 0.1)
+      risk_vr = float(lead.vRel)
+      risk_vlead = max(float(lead.vLead), 0.0)
+      closing_speed = max(-risk_vr, 0.0)
+
+      self.lead_speed_dbg = risk_vlead
+      if closing_speed > 0.10:
+        self.lead_ttc_dbg = min(risk_d / closing_speed, 99.0)
+
+      # Physical collision buffer, intentionally separate from comfort gap.
+      collision_buffer = 4.0
+      usable_distance = max(risk_d - collision_buffer, 1.0)
+      required_decel = ((closing_speed * closing_speed) /
+                        (2.0 * usable_distance)) if closing_speed > 0.0 else 0.0
+      self.required_decel_dbg = required_decel
+
+      near_stationary_or_slow = (
+        risk_vlead < 5.0 and       # <18 km/h lead
+        v_ego > 5.0 and           # don't alter normal crawling traffic
+        closing_speed > 3.0 and
+        self.lead_ttc_dbg < 6.5
+      )
+      extreme_risk = (
+        self.lead_ttc_dbg < 1.5 or
+        required_decel > 2.5
+      )
+      moving_risk_candidate = (
+        closing_speed > 3.0 and
+        (self.lead_ttc_dbg < 5.0 or required_decel > 1.2)
+      )
+
+      if moving_risk_candidate:
+        self.lead_brake_candidate_timer = min(
+          self.lead_brake_candidate_timer + DT_MDL, 1.0)
+      else:
+        self.lead_brake_candidate_timer = max(
+          self.lead_brake_candidate_timer - 2.0 * DT_MDL, 0.0)
+
+      risk_confirmed = (
+        near_stationary_or_slow or
+        extreme_risk or
+        self.lead_brake_candidate_timer >= 0.20
+      )
+      self.lead_brake_confirmed_dbg = bool(risk_confirmed)
+
+      if risk_confirmed and (
+          moving_risk_candidate or near_stationary_or_slow or extreme_risk):
+        authority_mag = clip(
+          required_decel * 1.20 + 0.10,
+          abs(A_CRUISE_MIN),
+          abs(MIN_ACCEL),
+        )
+
+        if near_stationary_or_slow:
+          slow_floor = interp(
+            self.lead_ttc_dbg,
+            [1.0, 2.0, 3.5, 6.5],
+            [4.0, 3.0, 2.1, 1.6],
+          )
+          authority_mag = max(authority_mag, slow_floor)
+
+        accel_limits[0] = min(accel_limits[0], -authority_mag)
+        self.brake_authority_dbg = authority_mag
+    else:
+      self.lead_brake_candidate_timer = 0.0
+
     # 2) v1.5.5 Traffic Comfort: continuous gap + relative-speed cap.
     #
     # Old behavior had a distance-only low cap, then a binary depart boost
@@ -428,7 +515,10 @@ class LongitudinalPlanner:
       self.a_desired = min(self.a_desired, a_prev + a_inc_max)
 
     if lead.status:
-      if v_ego < 10.0 and lead.dRel < 30.0 and not (lead.dRel < 8.0 or lead.vRel < -3.0):
+      # v1.5.7: keep normal low-speed decel smoothing even when a benign
+      # cut-in is physically close. Bypass smoothing only after the new
+      # dynamic braking-risk logic has actually confirmed danger.
+      if v_ego < 10.0 and lead.dRel < 30.0 and not self.lead_brake_confirmed_dbg:
         j_neg_limit = interp(v_ego, [0.0, 3.0, 8.0, 10.0], [0.35, 0.50, 0.80, 1.20])
         a_dec_max = j_neg_limit * DT_MDL
         if self.a_desired < a_prev:
@@ -474,6 +564,9 @@ class LongitudinalPlanner:
       f" CG={self.cruise_guard_cap_dbg:.2f} OV={self.cruise_overspeed_dbg:.1f}"
       f" D={lead.dRel:.1f} VR={lead.vRel:+.2f}"
       f" CP={self.cap_dbg:.2f} AS={self.away_speed_dbg:.2f} DC={self.depart_conf_dbg:.1f}"
+      f" BA={self.brake_authority_dbg:.2f} RQ={self.required_decel_dbg:.2f}"
+      f" TTC={self.lead_ttc_dbg:.1f} VL={self.lead_speed_dbg:.1f}"
+      f" BC={int(self.lead_brake_confirmed_dbg)}"
     ) if lead.status else (
       f"PL V={sm['carState'].vEgo*3.6:.1f}"
       f" GH={self.gear_hold_cap_dbg:.2f} AM={self.final_accel_max_dbg:.2f}"
