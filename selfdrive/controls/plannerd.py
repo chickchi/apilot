@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import numpy as np
-from cereal import car
+from cereal import car, log
 from selfdrive.modeld.constants import T_IDXS
 from common.params import Params
 from common.realtime import Priority, config_realtime_process
@@ -52,7 +52,10 @@ def plannerd_thread(sm=None, pm=None):
     if sm.updated['modelV2']:
       lateral_planner.update(sm)
       lateral_planner.publish(sm, pm)
-      longitudinal_planner.update(sm)
+      longitudinal_planner.update(
+        sm,
+        lateral_planner.DH.lane_change_state != log.LateralPlan.LaneChangeState.off,
+      )
       longitudinal_planner.publish(sm, pm)
       publish_ui_plan(sm, pm, lateral_planner, longitudinal_planner)
 
