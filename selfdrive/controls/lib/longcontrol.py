@@ -129,6 +129,15 @@ class LongControl:
     self.lead_start_d = 0.0
     self.v_target_start_lookahead = 0.0
 
+    # v1.5.8 clear-road / transmission state
+    self.prev_lane_change_active = False
+    self.prev_close_lead = False
+    self.clear_lead_confirm_timer = 0.0
+    self.clear_road_recovery_timer = 0.0
+    self.clear_road_recovery = False
+    self.hold6_down_request_timer = 0.0
+    self.load_pre_shift_dbg = False
+
     # v1.5.3 Adaptive TCU Load Manager
     # 0=NORMAL, 1=PRE_RELIEF, 2=SHIFT, 3=POST_SHIFT, 4=HOLD6, 5=RPM_PROTECT
     self.upshift_state = 0
@@ -173,8 +182,15 @@ class LongControl:
     self.upshift_protect_cap = 0.0
     self.upshift_shift_detected = False
     self.upshift_limit_active = False
+    self.hold6_down_request_timer = 0.0
+    self.load_pre_shift_dbg = False
+    self.prev_close_lead = False
+    self.clear_lead_confirm_timer = 0.0
+    self.clear_road_recovery_timer = 0.0
+    self.clear_road_recovery = False
 
-  def update(self, active, CS, long_plan, accel_limits, t_since_plan, CC, v_cruise_kph_apply, radar_state=None):
+  def update(self, active, CS, long_plan, accel_limits, t_since_plan, CC,
+             v_cruise_kph_apply, radar_state=None, lane_change_active=False):
     self.readParamCount += 1
     if self.readParamCount >= 100:
       self.readParamCount = 0
@@ -273,6 +289,49 @@ class LongControl:
           lead_vrel > 0.05
         )
 
+    # v1.5.8 safe post-lane-change positive-response window.
+    if lane_change_active:
+      self.clear_road_recovery_timer = 0.0
+    elif self.prev_lane_change_active:
+      self.clear_road_recovery_timer = 3.0
+    else:
+      self.clear_road_recovery_timer = max(
+        self.clear_road_recovery_timer - DT_CTRL, 0.0)
+    self.prev_lane_change_active = bool(lane_change_active)
+
+    cluster_kph_for_clear = float(CS.vEgoCluster * 3.6)
+    if cluster_kph_for_clear <= 0.5:
+      cluster_kph_for_clear = float(CS.vEgo * 3.6)
+    cruise_gap_for_clear = float(v_cruise_kph_apply) - cluster_kph_for_clear
+    clear_lead_for_recovery = (
+      (not self.lead_start_status) or
+      self.lead_start_d > 70.0 or
+      (self.lead_start_d > 50.0 and lead_vrel > -0.30)
+    )
+    if clear_lead_for_recovery:
+      self.clear_lead_confirm_timer = min(
+        self.clear_lead_confirm_timer + DT_CTRL, 1.0)
+    else:
+      self.clear_lead_confirm_timer = 0.0
+    clear_lead_confirmed = self.clear_lead_confirm_timer >= 0.30
+
+    close_lead_now = self.lead_start_status and self.lead_start_d < 45.0
+    # Arm on close->released; activation still waits for 0.30 s clear-road
+    # confirmation below.
+    if self.prev_close_lead and not close_lead_now:
+      self.clear_road_recovery_timer = max(
+        self.clear_road_recovery_timer, 2.0)
+    self.prev_close_lead = bool(close_lead_now)
+
+    self.clear_road_recovery = bool(
+      self.clear_road_recovery_timer > 0.0 and
+      clear_lead_confirmed and
+      cruise_gap_for_clear > 4.0 and
+      CS.vEgo > 8.0 and
+      not CS.gasPressed and
+      not CS.brakePressed
+    )
+
     self.long_control_state, planned_stop = long_control_state_trans(
       self.CP, active, self.long_control_state, CS.vEgo,
       v_target, v_target_1sec, v_target_1p8sec, CS.brakePressed,
@@ -355,6 +414,8 @@ class LongControl:
         [0.0, 20.0, 40.0, 60.0, 80.0, 100.0, 120.0, 140.0],
         [0.45, 0.38, 0.30, 0.24, 0.18, 0.15, 0.13, 0.12],
       )
+      if self.clear_road_recovery:
+        self.pos_accel_jerk_limit *= 1.50
 
       # v1.4 PID positive headroom above the planner feed-forward [m/s^2].
       # Low speed retains more correction authority for launch/load changes.
@@ -443,15 +504,15 @@ class LongControl:
       soft_rpm_base, hard_rpm_base = 2100.0, 2350.0
       soft_cap_base, shift_cap_base, protect_cap_base = 0.42, 0.34, 0.46
     elif current_gear == 4:
-      # v1.5.4: earlier but shallower 4->5 preparation.
-      soft_min_v, hard_min_v = 56.0, 50.0
-      soft_rpm_base, hard_rpm_base = 2200.0, 2425.0
-      soft_cap_base, shift_cap_base, protect_cap_base = 0.40, 0.31, 0.42
+      # v1.5.8: prepare 4->5 earlier and shallower.
+      soft_min_v, hard_min_v = 54.0, 50.0
+      soft_rpm_base, hard_rpm_base = 2150.0, 2375.0
+      soft_cap_base, shift_cap_base, protect_cap_base = 0.38, 0.29, 0.40
     elif current_gear == 5:
-      # v1.5.4: earlier 5->6 preparation; M=2 can add a second micro-lift.
-      soft_min_v, hard_min_v = 79.0, 65.0
-      soft_rpm_base, hard_rpm_base = 2100.0, 2300.0
-      soft_cap_base, shift_cap_base, protect_cap_base = 0.30, 0.20, 0.34
+      # v1.5.8: prepare 5->6 earlier; M2 still provides the micro-lift.
+      soft_min_v, hard_min_v = 78.0, 65.0
+      soft_rpm_base, hard_rpm_base = 2050.0, 2250.0
+      soft_cap_base, shift_cap_base, protect_cap_base = 0.29, 0.19, 0.33
     elif not gear_valid:
       # Conservative fallback if numeric gear is unavailable.
       soft_min_v, hard_min_v = 82.0, 78.0
@@ -467,9 +528,8 @@ class LongControl:
     # v1.5.4: large DV must not make upper gears wind out.
     if current_gear == 3:
       demand_rpm_boost = demand_rpm_boost_raw * 0.80
-    elif current_gear == 4:
-      demand_rpm_boost = demand_rpm_boost_raw * 0.35
-    elif current_gear == 5:
+    elif current_gear in (4, 5):
+      # v1.5.8: large DV must not postpone upper-gear relief.
       demand_rpm_boost = 0.0
     else:
       demand_rpm_boost = demand_rpm_boost_raw
@@ -521,13 +581,40 @@ class LongControl:
       assist_rpm >= self.upshift_hard_rpm
     )
 
-    # Preserve 6th only while it is clearly doing the job and the TCU has not
-    # yet requested a lower gear.  This is deliberately not a gear lock.
+    # v1.5.8 load-based pre-relief: don't wait only for TR/RPM.
+    load_pre_candidate = (
+      base_context and gear_valid and accel_response_ok and (
+        (current_gear == 4 and v_ego_kph >= 54.0 and dv_kph >= 8.0 and
+         self.raw_output_accel >= 0.38) or
+        (current_gear == 5 and v_ego_kph >= 78.0 and dv_kph >= 4.5 and
+         self.raw_output_accel >= 0.30)
+      )
+    )
+    self.load_pre_shift_dbg = bool(load_pre_candidate)
+
+    # Debounce TCU down requests while G6 is already pulling acceptably.
+    if gear_valid and current_gear == 6 and target_gear_valid and target_gear < 6:
+      self.hold6_down_request_timer = min(
+        self.hold6_down_request_timer + DT_CTRL, 1.0)
+    elif gear_valid and current_gear == 6:
+      self.hold6_down_request_timer = max(
+        self.hold6_down_request_timer - 2.0 * DT_CTRL, 0.0)
+    else:
+      self.hold6_down_request_timer = 0.0
+    tcu_down_persistent = self.hold6_down_request_timer >= 0.50
+
+    # v1.5.8 sticky HOLD6 through the final approach to cruise target.
+    # Unlike G3/G4/G5 shift preparation, HOLD6 may remain useful below the
+    # normal DV>2.5 base_context threshold, specifically to avoid a last
+    # unnecessary 6->5->6 ping-pong near the selected speed.
+    hold6_context = (
+      positive_control and not driver_override and dv_kph > 0.5
+    )
     hold6_candidate = (
-      base_context and gear_valid and current_gear == 6 and
-      78.0 <= v_ego_kph <= 94.0 and 3.0 <= dv_kph <= 25.0 and
-      output_accel > 0.38 and CS.aEgo > 0.08 and
-      (not target_gear_valid or target_gear >= 6)
+      hold6_context and gear_valid and current_gear == 6 and
+      78.0 <= v_ego_kph <= 100.5 and 0.5 <= dv_kph <= 25.0 and
+      output_accel > 0.28 and CS.aEgo > 0.05 and
+      not tcu_down_persistent
     )
 
     candidate_state = 0
@@ -537,7 +624,7 @@ class LongControl:
       candidate_state = 5
     elif tcu_up_candidate or hard_rpm_candidate:
       candidate_state = 2
-    elif soft_rpm_candidate:
+    elif soft_rpm_candidate or load_pre_candidate:
       candidate_state = 1
 
     # Short debounce: enough to reject a one-frame TG/RPM spike, not enough to
@@ -557,13 +644,16 @@ class LongControl:
     elif self.upshift_state == 0:
       self.upshift_candidate_timer = 0.0
 
-    # Braking/driver intervention always wins.
+    # Braking/driver intervention always wins. For M4 HOLD6 only, allow the
+    # state to taper smoothly down to DV=0.5 instead of the legacy DV=1.5
+    # generic abort threshold. Cruise overspeed guards remain downstream.
+    manager_dv_abort = 0.5 if self.upshift_state == 4 else 1.5
     abort_manager = (
       self.upshift_state != 0 and (
         driver_override or
         self.long_control_state != LongCtrlState.pid or
         self.raw_output_accel <= 0.0 or
-        dv_kph <= 1.5
+        dv_kph <= manager_dv_abort
       )
     )
     if abort_manager:
@@ -596,7 +686,13 @@ class LongControl:
         self.upshift_state = 5
         self.upshift_timer = 0.0
         self.upshift_entry_output = max(output_accel, 0.0)
-      elif tcu_up_candidate or hard_rpm_candidate:
+      elif (
+          tcu_up_candidate or hard_rpm_candidate or
+          (load_pre_candidate and (
+            (self.upshift_entry_gear == 4 and self.upshift_timer >= 0.40) or
+            (self.upshift_entry_gear == 5 and self.upshift_timer >= 0.45)
+          ))
+      ):
         self.upshift_state = 2
         self.upshift_timer = 0.0
         self.upshift_entry_output = max(output_accel, 0.0)
@@ -608,7 +704,13 @@ class LongControl:
         self.upshift_limit_active = True
 
         weak_response = self.upshift_timer > 0.50 and CS.aEgo < 0.02 and dv_kph > 5.0
-        rpm_recovered = rpm_valid and self.upshift_timer > 0.30 and assist_rpm < self.upshift_soft_rpm - 140.0
+        # RPM-recovered is meaningful for RPM-triggered PRE_RELIEF, but must
+        # not cancel the new load-based PRE_RELIEF before its 0.40/0.45 s
+        # progression threshold is reached.
+        rpm_recovered = (
+          rpm_valid and not load_pre_candidate and self.upshift_timer > 0.30 and
+          assist_rpm < self.upshift_soft_rpm - 140.0
+        )
         if weak_response or rpm_recovered or self.upshift_timer >= 2.0:
           self.upshift_state = 0
           self.upshift_timer = 0.0
@@ -733,20 +835,20 @@ class LongControl:
 
       hold6_cap = interp(
         dv_kph,
-        [3.0, 15.0, 25.0],
-        [0.35, 0.36, 0.37],
+        [0.5, 1.5, 3.0, 15.0, 25.0],
+        [0.10, 0.20, 0.30, 0.36, 0.37],
       )
       release_progress = min(self.upshift_timer / 0.30, 1.0)
       self.upshift_cap = self.upshift_entry_output + (hold6_cap - self.upshift_entry_output) * release_progress
       output_accel = min(output_accel, self.upshift_cap)
       self.upshift_limit_active = True
 
-      tcu_requests_down = target_gear_valid and target_gear < 6
-      weak_sixth = self.upshift_timer > 0.45 and CS.aEgo < 0.06 and dv_kph > 5.0
-      sixth_done = v_ego_kph >= 94.0 or dv_kph < 6.0
+      tcu_requests_down = self.hold6_down_request_timer >= 0.50
+      weak_sixth = self.upshift_timer > 0.60 and CS.aEgo < 0.05 and dv_kph > 4.0
+      sixth_done = dv_kph < 0.5
       sixth_lost = gear_valid and current_gear < 6
 
-      if tcu_requests_down or weak_sixth or sixth_done or sixth_lost or self.upshift_timer >= 5.0:
+      if tcu_requests_down or weak_sixth or sixth_done or sixth_lost or self.upshift_timer >= 7.0:
         self.upshift_state = 0
         self.upshift_timer = 0.0
         self.upshift_cooldown = 0.35
@@ -781,20 +883,18 @@ class LongControl:
     self.last_output_accel = clip(output_accel, accel_limits[0], accel_limits[1])
     self.pos_accel_cut = max(self.raw_output_accel - self.last_output_accel, 0.0)
 
-    # v1.5.3 debug:
-    # M: 0 normal / 1 pre / 2 shift / 3 post / 4 hold6 / 5 protect
+    # v1.5.8 debug. '|' is rendered as a real UI line break.
     self.debugLoCText = (
-      f"LC R={self.raw_output_accel:.2f} O={self.last_output_accel:.2f}"
-      f" M={self.upshift_state} G={current_gear}>{target_gear if target_gear_valid else 0}"
-      f" TR={int(assist_rpm)} S/H={int(self.upshift_soft_rpm)}/{int(self.upshift_hard_rpm)}"
-      f" CT={cruise_target_kph:.0f} DV={dv_kph:.1f}"
-      f" CG={self.cruise_guard_cap:.2f} OV={self.cruise_overspeed_kph:.1f}"
-      f" C={self.upshift_cap:.2f} T={self.upshift_timer:.2f}"
-      f" ML={int(self.upshift_state == 2 and self.upshift_entry_gear == 5 and self.upshift_timer > 0.65)}"
-      f" SD={int(self.upshift_shift_detected)} AE={CS.aEgo:.2f}"
-      f" LS={int(self.lead_start_status)}/{int(self.lead_start_moving)}/{int(self.lead_start_stationary)}"
-      f" LV={self.lead_start_v:.1f} LD={self.lead_start_d:.1f}"
-      f" V18={self.v_target_start_lookahead:.2f}"
+      f"LC R{self.raw_output_accel:.2f} O{self.last_output_accel:.2f} "
+      f"M{self.upshift_state} G{current_gear}>{target_gear if target_gear_valid else 0} "
+      f"TR{int(assist_rpm)} CT{cruise_target_kph:.0f} D{dv_kph:.1f}"
+      f"|C{self.upshift_cap:.2f} T{self.upshift_timer:.2f} "
+      f"J{self.pos_accel_jerk_limit:.2f} CR{int(self.clear_road_recovery)} "
+      f"LP{int(self.load_pre_shift_dbg)} H6D{self.hold6_down_request_timer:.2f}"
+      f"|CG{self.cruise_guard_cap:.2f}/{self.cruise_overspeed_kph:.1f} "
+      f"ML{int(self.upshift_state == 2 and self.upshift_entry_gear == 5 and self.upshift_timer > 0.65)} "
+      f"AE{CS.aEgo:.2f} LS{int(self.lead_start_status)}/{int(self.lead_start_moving)}/{int(self.lead_start_stationary)} "
+      f"LD{self.lead_start_d:.1f} V18{self.v_target_start_lookahead:.2f}"
     )
 
     return self.last_output_accel, -0.5 if planned_stop else j_target
