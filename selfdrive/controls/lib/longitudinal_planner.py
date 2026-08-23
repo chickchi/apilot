@@ -157,7 +157,7 @@ class LongitudinalPlanner:
     
     return x, v, a, j, y
 
-  def update(self, sm):
+  def update(self, sm, lane_change_active=False):
     if self.param_read_counter % 50 == 0:
       self.read_param()
     self.param_read_counter += 1
@@ -222,9 +222,10 @@ class LongitudinalPlanner:
     # a previously close lead. Activate it only if the new path is actually
     # clear and the selected cruise speed remains >4 km/h above ego speed.
     # ------------------------------------------------------------------
-    lane_change_active = (
-      sm['lateralPlan'].laneChangeState != log.LateralPlan.LaneChangeState.off
-    )
+    # v1.5.8.1 HOTFIX:
+    # plannerd publishes lateralPlan itself and does not subscribe to it.
+    # Receive the live lane-change state directly from LateralPlanner.
+    lane_change_active = bool(lane_change_active)
     if lane_change_active:
       self.clear_road_recovery_timer = 0.0
     elif self.prev_lane_change_active:
