@@ -13,21 +13,52 @@ LongCtrlState = car.CarControl.Actuators.LongControlState
 # planned_stop조건인데..... accel은 이미 stoppingAccel보다 낮은상태... 이상태로 stopping으로 진입하면.. 너무 많은 -accel로 정지하게 됨.
 # accel이 -값에서 0에 가까와질때까지 기다릴 필요가 있음.... 20230911
 def long_control_state_trans(CP, active, long_control_state, v_ego, v_target,
-                             v_target_1sec, brake_pressed, cruise_standstill, softHold, a_target_now):
+                             v_target_1sec, v_target_1p8sec,
+                             brake_pressed, cruise_standstill, softHold, a_target_now,
+                             lead_status=False, lead_d=0.0, lead_v=0.0, lead_vrel=0.0):
   # Ignore cruise standstill if car has a gas interceptor
   cruise_standstill = cruise_standstill and not CP.enableGasInterceptor
-  accelerating = v_target_1sec > (v_target + 0.01)
-  planned_stop = (v_target < CP.vEgoStopping and ## apilot: 내리막, 신호정지시 질질 가는 현상... v_target으로 보면.. 급정지, v_ego를 보면 질질감..
+
+  accelerating_1sec = v_target_1sec > (v_target + 0.01)
+  accelerating_1p8sec = v_target_1p8sec > (v_target + 0.01)
+
+  planned_stop = (v_target < CP.vEgoStopping and
                   v_target_1sec < CP.vEgoStopping and
-                  not accelerating)
+                  not accelerating_1sec)
   stay_stopped = (v_ego < CP.vEgoStopping and
                   (brake_pressed or cruise_standstill))
   stopping_condition = planned_stop or stay_stopped
 
-  starting_condition = (v_target_1sec > CP.vEgoStarting and
-                        accelerating and
-                        not cruise_standstill and
-                        not brake_pressed)
+  normal_start = (v_target_1sec > CP.vEgoStarting and
+                  accelerating_1sec and
+                  not cruise_standstill and
+                  not brake_pressed)
+
+  # v1.5.7 HKG-inspired lead-aware STOPPING release.
+  nearby_lead = lead_status and 0.0 < lead_d < 35.0
+  stationary_lead_gate = (
+    nearby_lead and
+    lead_d < 20.0 and
+    lead_v < 0.35 and
+    abs(lead_vrel) < 0.60
+  )
+  moving_lead_start = (
+    nearby_lead and
+    lead_v > max(float(CP.vEgoStarting), 0.50) and
+    lead_vrel > 0.05 and
+    v_target_1p8sec > CP.vEgoStarting and
+    accelerating_1p8sec and
+    not cruise_standstill and
+    not brake_pressed
+  )
+
+  if stationary_lead_gate:
+    starting_condition = False
+  elif moving_lead_start:
+    starting_condition = True
+  else:
+    starting_condition = normal_start
+
   started_condition = v_ego > CP.vEgoStarting
 
   if not active:
@@ -90,6 +121,14 @@ class LongControl:
     self.cruise_overspeed_kph = 0.0
     self.cruise_guard_active = False
 
+    # v1.5.7 lead-aware stop/restart diagnostics
+    self.lead_start_status = False
+    self.lead_start_moving = False
+    self.lead_start_stationary = False
+    self.lead_start_v = 0.0
+    self.lead_start_d = 0.0
+    self.v_target_start_lookahead = 0.0
+
     # v1.5.3 Adaptive TCU Load Manager
     # 0=NORMAL, 1=PRE_RELIEF, 2=SHIFT, 3=POST_SHIFT, 4=HOLD6, 5=RPM_PROTECT
     self.upshift_state = 0
@@ -135,7 +174,7 @@ class LongControl:
     self.upshift_shift_detected = False
     self.upshift_limit_active = False
 
-  def update(self, active, CS, long_plan, accel_limits, t_since_plan, CC, v_cruise_kph_apply):
+  def update(self, active, CS, long_plan, accel_limits, t_since_plan, CC, v_cruise_kph_apply, radar_state=None):
     self.readParamCount += 1
     if self.readParamCount >= 100:
       self.readParamCount = 0
@@ -187,10 +226,13 @@ class LongControl:
       #v_target_1sec = interp(self.CP.longitudinalActuatorDelayUpperBound + t_since_plan + 1.0, T_IDXS[:CONTROL_N], speeds)
       #v_target_1sec = interp(self.longitudinalActuatorDelayUpperBound + t_since_plan + 1.0, T_IDXS[:CONTROL_N], speeds)
       v_target_1sec = interp(self.longitudinalActuatorDelayLowerBound + t_since_plan + 1.0, T_IDXS[:CONTROL_N], speeds)
+      # Only STOPPING release uses this longer forecast.
+      v_target_1p8sec = interp(self.longitudinalActuatorDelayLowerBound + t_since_plan + 1.8, T_IDXS[:CONTROL_N], speeds)
     else:
       v_target = 0.0
       v_target_now = 0.0
       v_target_1sec = 0.0
+      v_target_1p8sec = 0.0
       a_target = 0.0
       j_target = 0.0
       a_target_lower = a_target_upper = 0.0
@@ -204,9 +246,39 @@ class LongControl:
 
     output_accel = self.last_output_accel
 
-    self.long_control_state, planned_stop = long_control_state_trans(self.CP, active, self.long_control_state, CS.vEgo,
-                                                       v_target, v_target_1sec, CS.brakePressed,
-                                                       CS.cruiseState.standstill, CC.hudControl.softHold, a_target_now)
+    # v1.5.7 actual radar lead is used only by the STOPPING release gate.
+    self.lead_start_status = False
+    self.lead_start_moving = False
+    self.lead_start_stationary = False
+    self.lead_start_v = 0.0
+    self.lead_start_d = 0.0
+    self.v_target_start_lookahead = float(v_target_1p8sec)
+
+    lead_vrel = 0.0
+    if radar_state is not None:
+      lead_one = radar_state.leadOne
+      if lead_one.status:
+        self.lead_start_status = True
+        self.lead_start_v = max(float(lead_one.vLead), 0.0)
+        self.lead_start_d = max(float(lead_one.dRel), 0.0)
+        lead_vrel = float(lead_one.vRel)
+        self.lead_start_stationary = (
+          self.lead_start_d < 20.0 and
+          self.lead_start_v < 0.35 and
+          abs(lead_vrel) < 0.60
+        )
+        self.lead_start_moving = (
+          self.lead_start_d < 35.0 and
+          self.lead_start_v > max(float(self.CP.vEgoStarting), 0.50) and
+          lead_vrel > 0.05
+        )
+
+    self.long_control_state, planned_stop = long_control_state_trans(
+      self.CP, active, self.long_control_state, CS.vEgo,
+      v_target, v_target_1sec, v_target_1p8sec, CS.brakePressed,
+      CS.cruiseState.standstill, CC.hudControl.softHold, a_target_now,
+      self.lead_start_status, self.lead_start_d, self.lead_start_v, lead_vrel,
+    )
 
     if self.long_control_state == LongCtrlState.off:
       self.reset(CS.vEgo)
@@ -720,6 +792,9 @@ class LongControl:
       f" C={self.upshift_cap:.2f} T={self.upshift_timer:.2f}"
       f" ML={int(self.upshift_state == 2 and self.upshift_entry_gear == 5 and self.upshift_timer > 0.65)}"
       f" SD={int(self.upshift_shift_detected)} AE={CS.aEgo:.2f}"
+      f" LS={int(self.lead_start_status)}/{int(self.lead_start_moving)}/{int(self.lead_start_stationary)}"
+      f" LV={self.lead_start_v:.1f} LD={self.lead_start_d:.1f}"
+      f" V18={self.v_target_start_lookahead:.2f}"
     )
 
     return self.last_output_accel, -0.5 if planned_stop else j_target
