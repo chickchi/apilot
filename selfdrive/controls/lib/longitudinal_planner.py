@@ -4,6 +4,7 @@ import numpy as np
 from common.numpy_fast import clip, interp
 
 import cereal.messaging as messaging
+from cereal import log
 from common.conversions import Conversions as CV
 from common.filter_simple import FirstOrderFilter
 from common.realtime import DT_MDL
@@ -100,6 +101,15 @@ class LongitudinalPlanner:
     self.lead_speed_dbg = 0.0
     self.lead_brake_confirmed_dbg = False
 
+    # v1.5.8 clear-road recovery state/debug
+    self.prev_lane_change_active = False
+    self.prev_close_lead = False
+    self.clear_lead_confirm_timer = 0.0
+    self.clear_road_recovery_timer = 0.0
+    self.clear_road_recovery_dbg = False
+    self.driving_mode_dbg = 0
+    self.mode_max_accel_dbg = 0.0
+
     self.gear_hold_cap_dbg = 0.0
     self.final_accel_max_dbg = 0.0
 
@@ -193,14 +203,68 @@ class LongitudinalPlanner:
         myMaxAccel = self.get_max_accel(v_ego)
 
       accel_limits = [A_CRUISE_MIN, myMaxAccel]
+      self.driving_mode_dbg = int(myDrivingMode)
+      self.mode_max_accel_dbg = float(myMaxAccel)
     
     else:
       # blended 등: 감속 여유는 열어두고(안전), 기본 상한은 MAX_ACCEL
       # accel_limits = [MIN_ACCEL, MAX_ACCEL]
       accel_limits = [A_CRUISE_MIN, MAX_ACCEL]
+      self.driving_mode_dbg = int(myDrivingMode)
+      self.mode_max_accel_dbg = float(MAX_ACCEL)
 
     # lead는 여기서 딱 1번만 읽기
     lead = sm['radarState'].leadOne
+
+    # ------------------------------------------------------------------
+    # v1.5.8 CLEAR-ROAD RECOVERY
+    # Start a short recovery window after lane-change completion or release of
+    # a previously close lead. Activate it only if the new path is actually
+    # clear and the selected cruise speed remains >4 km/h above ego speed.
+    # ------------------------------------------------------------------
+    lane_change_active = (
+      sm['lateralPlan'].laneChangeState != log.LateralPlan.LaneChangeState.off
+    )
+    if lane_change_active:
+      self.clear_road_recovery_timer = 0.0
+    elif self.prev_lane_change_active:
+      self.clear_road_recovery_timer = 3.0
+    else:
+      self.clear_road_recovery_timer = max(
+        self.clear_road_recovery_timer - DT_MDL, 0.0)
+
+    clear_lead = (
+      (not lead.status) or
+      lead.dRel > 70.0 or
+      (lead.dRel > 50.0 and lead.vRel > -0.30)
+    )
+    if clear_lead:
+      self.clear_lead_confirm_timer = min(
+        self.clear_lead_confirm_timer + DT_MDL, 1.0)
+    else:
+      self.clear_lead_confirm_timer = 0.0
+    clear_lead_confirmed = self.clear_lead_confirm_timer >= 0.30
+
+    close_lead_now = lead.status and lead.dRel < 45.0
+    # Arm recovery on the actual close->released transition. The independent
+    # clear_lead_confirmed gate below still requires 0.30 s of genuinely clear
+    # road before the recovery becomes active.
+    if self.prev_close_lead and not close_lead_now:
+      self.clear_road_recovery_timer = max(
+        self.clear_road_recovery_timer, 2.0)
+
+    cruise_gap_kph = v_cruise_cluster_kph - v_ego_cluster_kph
+    self.clear_road_recovery_dbg = bool(
+      self.clear_road_recovery_timer > 0.0 and
+      clear_lead_confirmed and
+      cruise_gap_kph > 4.0 and
+      v_ego > 8.0 and
+      not reset_state and
+      not sm['carState'].gasPressed and
+      not sm['carState'].brakePressed
+    )
+    self.prev_lane_change_active = bool(lane_change_active)
+    self.prev_close_lead = bool(close_lead_now)
 
     # v1.5.5 Traffic Comfort:
     # Detect a pulling-away lead early, but do not convert it into a binary
@@ -466,7 +530,11 @@ class LongitudinalPlanner:
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
     x, v, a, j, y = self.parse_model(sm['modelV2'], self.v_model_error, v_ego, self.autoTurnControl)
 
-    self.mpc.update(sm['carState'], sm['radarState'], sm['modelV2'], sm['controlsState'], v_cruise, x, v, a, j, y, prev_accel_constraint, reset_state)
+    self.mpc.update(
+      sm['carState'], sm['radarState'], sm['modelV2'], sm['controlsState'],
+      v_cruise, x, v, a, j, y, prev_accel_constraint, reset_state,
+      self.clear_road_recovery_dbg,
+    )
 
     self.v_desired_trajectory_full = np.interp(T_IDXS, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory_full = np.interp(T_IDXS, T_IDXS_MPC, self.mpc.a_solution)
@@ -552,28 +620,30 @@ class LongitudinalPlanner:
     #longitudinalPlan.debugLongText2 = self.mpc.debugLongText2
     lead = sm['radarState'].leadOne
 
-    # DEBUG ONLY: planner/MPC acceleration chain.
-    # GH = gear-hold acceleration cap
-    # AM = final max acceleration actually passed to MPC
-    # AD = planner internal desired acceleration after smoothing
-    # A0 = first point of MPC acceleration trajectory sent in longitudinalPlan
-    longitudinalPlan.debugLongText2 = (
-      f"PL V={sm['carState'].vEgo*3.6:.1f}"
-      f" GH={self.gear_hold_cap_dbg:.2f} AM={self.final_accel_max_dbg:.2f}"
-      f" AD={self.a_desired:.2f} A0={self.a_desired_trajectory[0]:.2f}"
-      f" CG={self.cruise_guard_cap_dbg:.2f} OV={self.cruise_overspeed_dbg:.1f}"
-      f" D={lead.dRel:.1f} VR={lead.vRel:+.2f}"
-      f" CP={self.cap_dbg:.2f} AS={self.away_speed_dbg:.2f} DC={self.depart_conf_dbg:.1f}"
-      f" BA={self.brake_authority_dbg:.2f} RQ={self.required_decel_dbg:.2f}"
-      f" TTC={self.lead_ttc_dbg:.1f} VL={self.lead_speed_dbg:.1f}"
-      f" BC={int(self.lead_brake_confirmed_dbg)}"
-    ) if lead.status else (
-      f"PL V={sm['carState'].vEgo*3.6:.1f}"
-      f" GH={self.gear_hold_cap_dbg:.2f} AM={self.final_accel_max_dbg:.2f}"
-      f" AD={self.a_desired:.2f} A0={self.a_desired_trajectory[0]:.2f}"
-      f" CG={self.cruise_guard_cap_dbg:.2f} OV={self.cruise_overspeed_dbg:.1f} L=0"
-    )
-    
+    # DEBUG ONLY (v1.5.8). '|' is a UI line-break delimiter.
+    if lead.status:
+      longitudinalPlan.debugLongText2 = (
+        f"PL V{sm['carState'].vEgo*3.6:.1f} DM{self.driving_mode_dbg} "
+        f"MX{self.mode_max_accel_dbg:.2f} AM{self.final_accel_max_dbg:.2f} "
+        f"AD{self.a_desired:.2f} A0{self.a_desired_trajectory[0]:.2f}"
+        f"|L D{lead.dRel:.1f} V{lead.vRel:+.2f} CP{self.cap_dbg:.2f} "
+        f"AS{self.away_speed_dbg:.2f} DC{self.depart_conf_dbg:.1f} "
+        f"RS{self.mpc.restart_stop_distance:.1f}"
+        f"|GH{self.gear_hold_cap_dbg:.2f} CG{self.cruise_guard_cap_dbg:.2f}/"
+        f"{self.cruise_overspeed_dbg:.1f} CR{int(self.clear_road_recovery_dbg)} "
+        f"BA{self.brake_authority_dbg:.2f} T{self.lead_ttc_dbg:.1f} "
+        f"BC{int(self.lead_brake_confirmed_dbg)}"
+      )
+    else:
+      longitudinalPlan.debugLongText2 = (
+        f"PL V{sm['carState'].vEgo*3.6:.1f} DM{self.driving_mode_dbg} "
+        f"MX{self.mode_max_accel_dbg:.2f} AM{self.final_accel_max_dbg:.2f} "
+        f"AD{self.a_desired:.2f} A0{self.a_desired_trajectory[0]:.2f}"
+        f"|GH{self.gear_hold_cap_dbg:.2f} CG{self.cruise_guard_cap_dbg:.2f}/"
+        f"{self.cruise_overspeed_dbg:.1f} CR{int(self.clear_road_recovery_dbg)} "
+        f"L0 RS{self.mpc.restart_stop_distance:.1f}"
+      )
+
     longitudinalPlan.trafficState = self.mpc.trafficState
     longitudinalPlan.xState = self.mpc.xState
     if self.mpc.trafficError:
