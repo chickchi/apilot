@@ -693,6 +693,7 @@ class Controls:
         CC.longActive, CS, long_plan, pid_accel_limits, t_since_plan, CC,
         self.cruise_helper.v_cruise_kph_apply,
         self.sm['radarState'],
+        self.sm['lateralPlan'].laneChangeState != LaneChangeState.off,
       )
       #self.debugText2 = 'Accel=[{:1.2f}]: {:1.2f},{:1.2f}'.format(actuators.accel, pid_accel_limits[0], pid_accel_limits[1])
       #print(self.debugText2)
