@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <QStringList>
 
 //#define __TEST
 
@@ -1712,7 +1713,7 @@ void DrawApilot::drawDebugText(UIState* s, bool show) {
 
     nvgTextAlign(s->vg, NVG_ALIGN_RIGHT | NVG_ALIGN_BOTTOM);
 
-    int y = 350, dy = 40;
+    int y = 300, dy = 34;
 
     const int text_x = s->fb_w - 20;
     const auto live_torque_params = sm["liveTorqueParameters"].getLiveTorqueParameters();
@@ -1735,12 +1736,21 @@ void DrawApilot::drawDebugText(UIState* s, bool show) {
     ui_draw_text(s, text_x, y, str, 35, COLOR_WHITE, BOLD, 0.0f, 0.0f);
 
     auto controls_state = sm["controlsState"].getControlsState();
+    // v1.5.8: split planner / LongControl diagnostics at '|'.
+    auto draw_long_debug = [&](const QString &text) {
+        const QStringList parts = text.split('|');
+        for (const QString &part : parts) {
+            if (part.trimmed().isEmpty()) continue;
+            y += 28;
+            const std::string line = part.trimmed().toStdString();
+            ui_draw_text(s, text_x, y, line.c_str(), 26, COLOR_WHITE, BOLD, 0.0f, 0.0f);
+        }
+    };
+
     qstr = QString::fromStdString(controls_state.getDebugText1().cStr());
-    y += dy;
-    ui_draw_text(s, text_x, y, qstr.toStdString().c_str(), 35, COLOR_WHITE, BOLD, 0.0f, 0.0f);
+    draw_long_debug(qstr);
     qstr = QString::fromStdString(controls_state.getDebugText2().cStr());
-    y += dy;
-    ui_draw_text(s, text_x, y, qstr.toStdString().c_str(), 35, COLOR_WHITE, BOLD, 0.0f, 0.0f);
+    draw_long_debug(qstr);
     const auto road_limit_speed = sm["roadLimitSpeed"].getRoadLimitSpeed();
     int xTurnInfo = road_limit_speed.getXTurnInfo();
     int xDistToTurn = road_limit_speed.getXDistToTurn();
