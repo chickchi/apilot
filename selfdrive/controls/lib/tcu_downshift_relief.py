@@ -1,4 +1,4 @@
-"""Observation-only TCU downshift load relief for apilot v1.6.0.
+"""Observation-only TCU downshift load relief for apilot v1.6.1.
 
 This module never requests a gear.  It only returns a positive-acceleration
 ceiling while the stock TCU remains solely responsible for gear selection.
@@ -69,12 +69,31 @@ class TcuDownshiftRelief:
     )
 
   @staticmethod
-  def _g6_prevent_cap(dv_kph):
-    return interp(
+  def _g6_prevent_cap(dv_kph, assist_rpm=0.0):
+    # v1.6.1: permit a little more 6th-gear load on the observed
+    # 1,850-RPM gentle hill, while backing off earlier in the observed
+    # 1,680-RPM 6->5 event.  The RPM correction fades out for large speed
+    # deficits where the stock TCU should remain free to choose a lower gear.
+    base_cap = interp(
       dv_kph,
-      [0.5, 1.5, 3.0, 15.0, 25.0, 35.0],
-      [0.06, 0.10, 0.14, 0.25, 0.29, 0.32],
+      [0.5, 1.5, 3.0, 6.0, 10.0, 15.0, 25.0, 35.0],
+      [0.06, 0.10, 0.14, 0.20, 0.22, 0.22, 0.29, 0.32],
     )
+
+    if float(assist_rpm) <= 700.0:
+      return base_cap
+
+    rpm_adjust = interp(
+      assist_rpm,
+      [1500.0, 1600.0, 1700.0, 1800.0, 1900.0, 2100.0],
+      [-0.03, -0.03, -0.02, 0.00, 0.02, 0.03],
+    )
+    rpm_weight = interp(
+      dv_kph,
+      [0.5, 3.0, 6.0, 10.0, 15.0, 20.0, 25.0],
+      [0.0, 0.0, 0.8, 1.0, 1.0, 0.5, 0.0],
+    )
+    return max(base_cap + rpm_adjust * rpm_weight, 0.0)
 
   @staticmethod
   def _g5_target_cap(dv_kph):
@@ -94,7 +113,8 @@ class TcuDownshiftRelief:
 
   def update(self, dt, positive_control, driver_override,
              raw_output_accel, output_accel, cluster_kph, dv_kph,
-             current_gear, target_gear, target_gear_valid, a_ego):
+             current_gear, target_gear, target_gear_valid, a_ego,
+             assist_rpm=0.0):
     dt = max(float(dt), 0.0)
     current_gear = int(current_gear)
     target_gear = int(target_gear)
@@ -308,7 +328,7 @@ class TcuDownshiftRelief:
       70.0 <= cluster_kph <= 115.0 and
       0.5 <= dv_kph <= 35.0
     ):
-      cap = self._g6_prevent_cap(dv_kph)
+      cap = self._g6_prevent_cap(dv_kph, assist_rpm)
       return TcuDownshiftReliefResult(
         state=TcuDownshiftReliefState.PREVENT_G6,
         cap=cap,
