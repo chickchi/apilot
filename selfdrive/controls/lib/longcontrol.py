@@ -245,7 +245,7 @@ class LongControl:
     self.hold6_down_request_timer = 0.0
     self.load_pre_shift_dbg = False
 
-    # v1.6.0 observation-only downshift load relief
+    # v1.6.1 observation-only downshift load relief
     self.downshift_relief = TcuDownshiftRelief()
     self.downshift_relief_state = 0
     self.downshift_relief_cap = 0.0
@@ -981,7 +981,7 @@ class LongControl:
     # =====================================================================
     # ADAPTIVE TCU LOAD MANAGER
     #
-    # v1.6.0 changes:
+    # v1.6.0/v1.6.1 changes:
     # - pre-emptively reduce positive TCU load in 5th/6th
     # - react immediately when the observed TCU target drops
     # - replace repeated post-downshift pumping with one stable relief window
@@ -1277,6 +1277,7 @@ class LongControl:
       target_gear,
       target_gear_valid,
       CS.aEgo,
+      assist_rpm,
     )
 
     self.downshift_relief_state = int(
@@ -2188,7 +2189,7 @@ class LongControl:
           else 0
         )
 
-    # v1.6.0 downshift relief is applied after the legacy manager so the
+    # v1.6.1 downshift relief is applied after the legacy manager so the
     # lowest positive ceiling wins.  It can never make an acceleration
     # request larger and is bypassed for negative control/driver override.
     if (
@@ -2290,7 +2291,7 @@ class LongControl:
       0.0,
     )
 
-    # v1.6.0 debug
+    # v1.6.1 debug
     self.debugLoCText = (
       f"LC R{self.raw_output_accel:.2f} "
       f"O{self.last_output_accel:.2f} "
