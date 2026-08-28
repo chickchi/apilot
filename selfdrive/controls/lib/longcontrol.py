@@ -3,6 +3,7 @@ from common.numpy_fast import clip, interp
 from common.realtime import DT_CTRL
 from selfdrive.controls.lib.drive_helpers import CONTROL_N, apply_deadzone
 from selfdrive.controls.lib.pid import PIDController
+from selfdrive.controls.lib.tcu_downshift_relief import TcuDownshiftRelief
 from selfdrive.modeld.constants import T_IDXS
 from common.params import Params
 
@@ -244,6 +245,15 @@ class LongControl:
     self.hold6_down_request_timer = 0.0
     self.load_pre_shift_dbg = False
 
+    # v1.6.0 observation-only downshift load relief
+    self.downshift_relief = TcuDownshiftRelief()
+    self.downshift_relief_state = 0
+    self.downshift_relief_cap = 0.0
+    self.downshift_relief_active = False
+    self.downshift_relief_suppress_legacy = False
+    self.downshift_relief_target_timer = 0.0
+    self.downshift_relief_cooldown = 0.0
+
     # Adaptive TCU Load Manager
     #
     # 0 NORMAL
@@ -325,6 +335,14 @@ class LongControl:
 
     self.hold6_down_request_timer = 0.0
     self.load_pre_shift_dbg = False
+
+    self.downshift_relief.reset()
+    self.downshift_relief_state = 0
+    self.downshift_relief_cap = 0.0
+    self.downshift_relief_active = False
+    self.downshift_relief_suppress_legacy = False
+    self.downshift_relief_target_timer = 0.0
+    self.downshift_relief_cooldown = 0.0
 
     self.prev_close_lead = False
 
@@ -963,7 +981,11 @@ class LongControl:
     # =====================================================================
     # ADAPTIVE TCU LOAD MANAGER
     #
-    # v1.5.9 changes:
+    # v1.6.0 changes:
+    # - pre-emptively reduce positive TCU load in 5th/6th
+    # - react immediately when the observed TCU target drops
+    # - replace repeated post-downshift pumping with one stable relief window
+    # - release protection after confirmed real deceleration
     # - stronger/clearer G5 -> G6 accelerator lift opportunity
     # - G5 can continue shift preparation down to DV=0.5 km/h
     # - G5 shift preparation no longer requires aEgo > +0.08
@@ -1243,6 +1265,48 @@ class LongControl:
       current_gear
     )
 
+    downshift_relief = self.downshift_relief.update(
+      DT_CTRL,
+      positive_control,
+      driver_override,
+      self.raw_output_accel,
+      output_accel,
+      v_ego_cluster_kph,
+      dv_kph,
+      current_gear,
+      target_gear,
+      target_gear_valid,
+      CS.aEgo,
+    )
+
+    self.downshift_relief_state = int(
+      downshift_relief.state
+    )
+    self.downshift_relief_cap = float(
+      downshift_relief.cap
+    )
+    self.downshift_relief_active = bool(
+      downshift_relief.active
+    )
+    self.downshift_relief_suppress_legacy = bool(
+      downshift_relief.suppress_legacy
+    )
+    self.downshift_relief_target_timer = float(
+      downshift_relief.target_down_timer
+    )
+    self.downshift_relief_cooldown = float(
+      downshift_relief.cooldown
+    )
+
+    if downshift_relief.actual_downshift:
+      self.upshift_state = 0
+      self.upshift_timer = 0.0
+      self.upshift_candidate_timer = 0.0
+      self.upshift_cooldown = max(
+        self.upshift_cooldown,
+        5.0,
+      )
+
     # v1.5.9:
     # The old universal aEgo>0.08 condition could block G5 relief exactly
     # when the engine was winding out but longitudinal acceleration was weak.
@@ -1452,6 +1516,18 @@ class LongControl:
       load_pre_candidate
     ):
       candidate_state = 1
+
+    if self.downshift_relief_suppress_legacy:
+      candidate_state = 0
+
+      if self.upshift_state != 0:
+        self.upshift_state = 0
+        self.upshift_timer = 0.0
+        self.upshift_candidate_timer = 0.0
+        self.upshift_cooldown = max(
+          self.upshift_cooldown,
+          self.downshift_relief_cooldown,
+        )
 
     if (
       self.upshift_state == 0 and
@@ -1719,115 +1795,37 @@ class LongControl:
       else:
         if self.upshift_entry_gear == 5:
           # ===============================================================
-          # v1.5.9 HUMAN-LIKE 5->6 ACCELERATOR LIFT
+          # v1.6.0 MONOTONIC 5->6 ACCELERATOR RELIEF
           #
-          # 0.00 ~ 0.45 : ease to ~0.18
-          # 0.45 ~ 0.70 : deeper brief lift to ~0.05
-          # 0.70 ~ 1.05 : hold that short lift
-          # 1.05 ~ 1.35 : restore to ~0.16
-          # 1.35 ~ 1.75 : wait briefly for TCU response
-          #
-          # This is NOT a gear command.
+          # One smooth release is held without the old 0.18->0.05->0.16
+          # accelerator pulse.  The stock TCU still chooses the gear.
           # ===============================================================
-          stage_a_cap = min(
+          steady_lift_cap = min(
             self.upshift_shift_cap,
-            0.18 +
-            demand_cap_boost *
-            0.15,
+            interp(
+              dv_kph,
+              [0.5, 5.0, 15.0, 35.0],
+              [0.08, 0.10, 0.14, 0.18],
+            ),
           )
 
-          lift_cap = min(
-            0.05 +
-            demand_cap_boost *
-            0.10,
-            stage_a_cap,
+          release_progress = min(
+            self.upshift_timer /
+            0.35,
+            1.0,
           )
 
-          recover_cap = min(
-            0.16 +
-            demand_cap_boost *
-            0.20,
-            self.upshift_soft_cap,
+          target_cap = (
+            self.upshift_entry_output +
+            (
+              steady_lift_cap -
+              self.upshift_entry_output
+            ) *
+            release_progress
           )
 
-          if (
-            self.upshift_timer <=
-            0.45
-          ):
-            release_progress = min(
-              self.upshift_timer /
-              0.25,
-              1.0,
-            )
-
-            target_cap = (
-              self.upshift_entry_output +
-              (
-                stage_a_cap -
-                self.upshift_entry_output
-              ) *
-              release_progress
-            )
-
-          elif (
-            self.upshift_timer <=
-            0.70
-          ):
-            lift_progress = min(
-              (
-                self.upshift_timer -
-                0.45
-              ) /
-              0.25,
-              1.0,
-            )
-
-            target_cap = (
-              stage_a_cap +
-              (
-                lift_cap -
-                stage_a_cap
-              ) *
-              lift_progress
-            )
-
-          elif (
-            self.upshift_timer <=
-            1.05
-          ):
-            target_cap = (
-              lift_cap
-            )
-
-          elif (
-            self.upshift_timer <=
-            1.35
-          ):
-            recover_progress = min(
-              (
-                self.upshift_timer -
-                1.05
-              ) /
-              0.30,
-              1.0,
-            )
-
-            target_cap = (
-              lift_cap +
-              (
-                recover_cap -
-                lift_cap
-              ) *
-              recover_progress
-            )
-
-          else:
-            target_cap = (
-              recover_cap
-            )
-
-          shift_timeout = 1.75
-          weak_check_time = 1.10
+          shift_timeout = 2.50
+          weak_check_time = 1.20
 
         elif self.upshift_entry_gear == 4:
           release_progress = min(
@@ -1914,7 +1912,7 @@ class LongControl:
 
           # Avoid repeated accelerator pumping when the TCU declines a 5->6.
           self.upshift_cooldown = (
-            1.50
+            5.00
             if failed_gear == 5
             else 0.50
           )
@@ -2190,6 +2188,29 @@ class LongControl:
           else 0
         )
 
+    # v1.6.0 downshift relief is applied after the legacy manager so the
+    # lowest positive ceiling wins.  It can never make an acceleration
+    # request larger and is bypassed for negative control/driver override.
+    if (
+      self.downshift_relief_active and
+      output_accel > 0.0
+    ):
+      output_accel = min(
+        output_accel,
+        self.downshift_relief_cap,
+      )
+
+      self.upshift_limit_active = True
+
+      if (
+        self.upshift_cap <= 0.0 or
+        self.downshift_relief_cap <
+        self.upshift_cap
+      ):
+        self.upshift_cap = (
+          self.downshift_relief_cap
+        )
+
     # =====================================================================
     # v1.5.6 CRUISE SPEED FAIL-SAFE
     #
@@ -2269,7 +2290,7 @@ class LongControl:
       0.0,
     )
 
-    # v1.5.9 debug
+    # v1.6.0 debug
     self.debugLoCText = (
       f"LC R{self.raw_output_accel:.2f} "
       f"O{self.last_output_accel:.2f} "
@@ -2285,6 +2306,10 @@ class LongControl:
       f"CR{int(self.clear_road_recovery)} "
       f"LP{int(self.load_pre_shift_dbg)} "
       f"H6D{self.hold6_down_request_timer:.2f}"
+      f"|DR{self.downshift_relief_state} "
+      f"DC{self.downshift_relief_cap:.2f} "
+      f"DT{self.downshift_relief_target_timer:.2f} "
+      f"DX{self.downshift_relief_cooldown:.2f}"
       f"|CG{self.cruise_guard_cap:.2f}/"
       f"{self.cruise_overspeed_kph:.1f} "
       f"ML{int(self.upshift_state == 2 and self.upshift_entry_gear == 5 and self.upshift_timer > 0.45)} "
