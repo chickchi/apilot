@@ -284,6 +284,11 @@ class LongControl:
     self.upshift_shift_detected = False
     self.upshift_limit_active = False
 
+    # v1.6.2: latched during the deeper, still observation-only 5->6 lift.
+    # This never commands a gear; it only makes the SCC acceleration request
+    # more coast-like when the stock TCU keeps targetGear=5 at high RPM.
+    self.g5_upshift_nudge_active = False
+
     self.longitudinalActuatorDelayLowerBound = (
       float(
         int(
@@ -318,6 +323,7 @@ class LongControl:
 
     self.upshift_entry_output = 0.0
     self.upshift_entry_speed = 0.0
+    self.g5_upshift_nudge_active = False
     self.upshift_entry_gear = 0
     self.upshift_post_gear = 0
 
@@ -1634,6 +1640,14 @@ class LongControl:
       self.upshift_entry_gear
     )
 
+    # The G5 coast nudge is a latch only for one continuous M2 5->6 attempt.
+    # Clear it everywhere else so a later attempt starts from the normal cap.
+    if not (
+      self.upshift_state == 2 and
+      self.upshift_entry_gear == 5
+    ):
+      self.g5_upshift_nudge_active = False
+
     # ---------------------------------------------------------------------
     # M1 PRE_RELIEF
     # ---------------------------------------------------------------------
@@ -1796,10 +1810,16 @@ class LongControl:
       else:
         if self.upshift_entry_gear == 5:
           # ===============================================================
-          # v1.6.0 MONOTONIC 5->6 ACCELERATOR RELIEF
+          # v1.6.2 MONOTONIC 5->6 ACCELERATOR RELIEF + STUBBORN-TCU NUDGE
           #
-          # One smooth release is held without the old 0.18->0.05->0.16
-          # accelerator pulse.  The stock TCU still chooses the gear.
+          # v1.6.1 road video showed two complete M2 attempts while the TCU
+          # stayed G5>5 (roughly 2360~2570 RPM). Each 2.5 s attempt then
+          # imposed a 5 s retry cooldown, so 5th was held almost to CT105.
+          #
+          # Keep the original smooth release first. If the stock TCU still
+          # reports targetGear=5 at high RPM, progressively deepen the same
+          # single lift instead of returning to a large accelerator request.
+          # The stock TCU remains the sole gear selector.
           # ===============================================================
           steady_lift_cap = min(
             self.upshift_shift_cap,
@@ -1809,6 +1829,35 @@ class LongControl:
               [0.08, 0.10, 0.14, 0.18],
             ),
           )
+
+          stubborn_g5 = (
+            gear_valid and
+            current_gear == 5 and
+            target_gear_valid and
+            target_gear == 5 and
+            rpm_valid and
+            assist_rpm >= 2350.0 and
+            v_ego_kph >= 88.0 and
+            dv_kph >= 2.0 and
+            CS.aEgo > -0.05
+          )
+
+          if (
+            stubborn_g5 and
+            self.upshift_timer >= 1.10
+          ):
+            self.g5_upshift_nudge_active = True
+
+          if self.g5_upshift_nudge_active:
+            deep_lift_cap = interp(
+              self.upshift_timer,
+              [1.10, 1.80, 2.60, 3.20],
+              [steady_lift_cap, 0.09, 0.07, 0.06],
+            )
+            steady_lift_cap = min(
+              steady_lift_cap,
+              deep_lift_cap,
+            )
 
           release_progress = min(
             self.upshift_timer /
@@ -1825,8 +1874,10 @@ class LongControl:
             release_progress
           )
 
-          shift_timeout = 2.50
-          weak_check_time = 1.20
+          # Give one continuous lift enough time to influence grade-hold
+          # logic before retrying. Meaningful deceleration still aborts.
+          shift_timeout = 3.40
+          weak_check_time = 1.40
 
         elif self.upshift_entry_gear == 4:
           release_progress = min(
@@ -1911,12 +1962,18 @@ class LongControl:
           self.upshift_state = 0
           self.upshift_timer = 0.0
 
-          # Avoid repeated accelerator pumping when the TCU declines a 5->6.
-          self.upshift_cooldown = (
-            5.00
-            if failed_gear == 5
-            else 0.50
-          )
+          # v1.6.2: 5 s was long enough to strand the observed run in G5
+          # until CT105. A deep nudge that the TCU still rejects gets a
+          # conservative 3 s rest; a normal G5 attempt can retry sooner.
+          if failed_gear == 5:
+            self.upshift_cooldown = (
+              3.00
+              if self.g5_upshift_nudge_active
+              else 1.50
+            )
+            self.g5_upshift_nudge_active = False
+          else:
+            self.upshift_cooldown = 0.50
 
     # ---------------------------------------------------------------------
     # M5 RPM_PROTECT
@@ -2291,7 +2348,7 @@ class LongControl:
       0.0,
     )
 
-    # v1.6.1 debug
+    # v1.6.2 debug
     self.debugLoCText = (
       f"LC R{self.raw_output_accel:.2f} "
       f"O{self.last_output_accel:.2f} "
@@ -2303,6 +2360,7 @@ class LongControl:
       f"D{dv_kph:.1f}"
       f"|C{self.upshift_cap:.2f} "
       f"T{self.upshift_timer:.2f} "
+      f"UC{self.upshift_cooldown:.2f} "
       f"J{self.pos_accel_jerk_limit:.2f} "
       f"CR{int(self.clear_road_recovery)} "
       f"LP{int(self.load_pre_shift_dbg)} "
@@ -2314,6 +2372,7 @@ class LongControl:
       f"|CG{self.cruise_guard_cap:.2f}/"
       f"{self.cruise_overspeed_kph:.1f} "
       f"ML{int(self.upshift_state == 2 and self.upshift_entry_gear == 5 and self.upshift_timer > 0.45)} "
+      f"GN{int(self.g5_upshift_nudge_active)} "
       f"AE{CS.aEgo:.2f} "
       f"LS{int(self.lead_start_status)}/"
       f"{int(self.lead_start_moving)}/"
