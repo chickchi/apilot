@@ -1,4 +1,4 @@
-"""Observation-only TCU downshift load relief for apilot v1.6.1.
+"""Observation-only TCU downshift load relief for apilot v1.6.3.
 
 This module never requests a gear.  It only returns a positive-acceleration
 ceiling while the stock TCU remains solely responsible for gear selection.
@@ -38,6 +38,7 @@ class TcuDownshiftRelief:
   TARGET_HOLD_TIME = 0.60
   POST_RELIEF_TIME = 1.50
   LEGACY_COOLDOWN_TIME = 5.00
+  G6_TO_G5_COOLDOWN_TIME = 1.50
   DECEL_ESCAPE_CONFIRM_TIME = 0.80
   DECEL_ESCAPE_HOLD_TIME = 1.00
 
@@ -83,10 +84,15 @@ class TcuDownshiftRelief:
     if float(assist_rpm) <= 700.0:
       return base_cap
 
+    # v1.6.3: make the 6th-gear hold strongly RPM-sensitive.  The road
+    # video showed G6 at ~1,680 RPM dropping to G5 while accelerating, but
+    # another hill case around ~1,880 RPM could usefully remain in G6 with
+    # more load.  Keep positive acceleration in both cases, but back off
+    # earlier at low RPM so the stock TCU has less reason to request G5.
     rpm_adjust = interp(
       assist_rpm,
       [1500.0, 1600.0, 1700.0, 1800.0, 1900.0, 2100.0],
-      [-0.03, -0.03, -0.02, 0.00, 0.02, 0.03],
+      [-0.06, -0.055, -0.05, -0.01, 0.025, 0.04],
     )
     rpm_weight = interp(
       dv_kph,
@@ -105,10 +111,12 @@ class TcuDownshiftRelief:
 
   @staticmethod
   def _g6_target_cap(dv_kph):
+    # Once the TCU explicitly asks for a lower gear, keep one continuous
+    # positive-torque relief rather than an accelerator off/on pulse.
     return interp(
       dv_kph,
       [0.5, 1.5, 3.0, 15.0, 35.0],
-      [0.03, 0.05, 0.08, 0.18, 0.24],
+      [0.03, 0.05, 0.08, 0.16, 0.22],
     )
 
   def update(self, dt, positive_control, driver_override,
@@ -140,7 +148,15 @@ class TcuDownshiftRelief:
     if actual_downshift:
       self.downshift_from_gear = self.previous_gear
       self.post_relief_timer = self.POST_RELIEF_TIME
-      self.cooldown = self.LEGACY_COOLDOWN_TIME
+      # v1.6.3: a 6->5 event should not strand the vehicle in 5th for the
+      # old universal 5 s legacy cooldown.  Let the 1.5 s post-downshift
+      # stabilization finish, then allow the positive 5->6 plateau to retry.
+      # Keep the conservative 5 s rest for lower-gear downshifts.
+      self.cooldown = (
+        self.G6_TO_G5_COOLDOWN_TIME
+        if self.previous_gear == 6 and current_gear == 5
+        else self.LEGACY_COOLDOWN_TIME
+      )
       self.target_hold_timer = 0.0
       self.target_down_timer = 0.0
       self.target_relief_elapsed = 0.0
