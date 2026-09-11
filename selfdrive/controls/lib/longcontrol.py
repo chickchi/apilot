@@ -1309,13 +1309,10 @@ class LongControl:
       self.upshift_state = 0
       self.upshift_timer = 0.0
       self.upshift_candidate_timer = 0.0
-      # v1.6.3: after 6->5, wait only through the post-shift settling
-      # window.  Other downshifts keep the conservative legacy cooldown.
-      downshift_retry_cooldown = (
-        1.50
-        if gear_valid and current_gear == 5
-        else 5.00
-      )
+      # v1.7.0 Recovery Ladder owns post-downshift recovery.  The legacy
+      # upshift manager only needs the short mechanical settle interval; a
+      # fixed 5 s 5->4 lock was the main cause of high-RPM 4th-gear recovery.
+      downshift_retry_cooldown = 0.65
       self.upshift_cooldown = max(
         self.upshift_cooldown,
         downshift_retry_cooldown,
