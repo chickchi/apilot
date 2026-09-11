@@ -9,6 +9,7 @@ from selfdrive.car.hyundai.values import HyundaiFlags, Buttons, CarControllerPar
 import random
 from random import randint
 from common.params import Params
+from selfdrive.swaglog import cloudlog
 
 VisualAlert = car.CarControl.HUDControl.VisualAlert
 LongCtrlState = car.CarControl.Actuators.LongControlState
@@ -303,6 +304,21 @@ class CarController:
           jerk_l = min(max(1.0, -jerk * 2.0), jerk_max)
           cb_upper = clip(0.9 + accel * 0.2, 0, 1.2)
           cb_lower = clip(0.8 + accel * 0.2, 0, 1.2)
+
+        # v1.7.0: 2 Hz transmit-boundary trace.  This is logging only; it sends
+        # no extra CAN message.  Comparing SRC/TX with [GEAR_CTL] proves whether
+        # a recovery ceiling actually reached the Hyundai SCC command path.
+        if self.frame % 50 == 0:
+          try:
+            cloudlog.info(
+              f"[GEAR_TX] G={int(getattr(CS.out, 'currentGear', 0))}>"
+              f"{int(getattr(CS.out, 'targetGear', 0))} "
+              f"RPM={float(getattr(CS.out, 'tcuRpm', 0.0)):.0f} "
+              f"SRC={float(actuators.accel):.2f} TX={float(accel):.2f} "
+              f"AE={float(CS.out.aEgo):.2f}"
+            )
+          except Exception:
+            pass
 
         can_sends.extend(hyundaican.create_acc_commands_mix_scc(self.CP, self.packer, CC.enabled, accel, jerk_u, jerk_l, int(self.frame / 2),
                                                       hud_control, set_speed_in_units, stopping, CC, CS, self.softHoldMode, cb_upper, cb_lower))
