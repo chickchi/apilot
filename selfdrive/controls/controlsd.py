@@ -597,20 +597,33 @@ class Controls:
         autoEngage = True
       if self.events.any(ET.ENABLE) or autoEngage:
         if self.events.any(ET.NO_ENTRY):
-          self.current_alert_types.append(ET.NO_ENTRY)
+          self.current_alert_types.append(ET.NO_ENTRY)        
 
         else:
+          # Manual button engage(MAIN/SET/RES) 여부와
+          # AutoEngage 모드를 enableAutoEngage 초기화 전에 보존한다.
+          manual_enable = self.events.any(ET.ENABLE)
+          auto_engage_long = self.enableAutoEngage == 2
+
           self.enableAutoEngage = 0
+
           if self.events.any(ET.PRE_ENABLE):
             self.state = State.preEnabled
           elif self.events.any(ET.OVERRIDE_LATERAL) or self.events.any(ET.OVERRIDE_LONGITUDINAL):
             self.state = State.overriding
           else:
             self.state = State.enabled
+
           self.current_alert_types.append(ET.ENABLE)
           self.v_cruise_helper.initialize_v_cruise(CS)
-          self.cruise_helper.longActiveUser = 1 if self.enableAutoEngage == 2 else 0           
 
+          # MAIN으로 APilot을 수동 engage한 경우 longitudinal도 동시에 ON.
+          # AutoEngage==2의 기존 longitudinal 자동활성 기능도 보존.
+          self.cruise_helper.longActiveUser = 1 if (manual_enable or auto_engage_long) else 0
+
+          if self.cruise_helper.longActiveUser > 0:
+            self.cruise_helper.userCruisePaused = False
+    
     # Check if openpilot is engaged and actuators are enabled
     self.enabled = self.state in ENABLED_STATES
     self.active = self.state in ACTIVE_STATES
