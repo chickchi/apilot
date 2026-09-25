@@ -600,9 +600,27 @@ class Controls:
           self.current_alert_types.append(ET.NO_ENTRY)        
 
         else:
-          # Manual button engage(MAIN/SET/RES) 여부와
-          # AutoEngage 모드를 enableAutoEngage 초기화 전에 보존한다.
-          manual_enable = self.events.any(ET.ENABLE)
+          # HKG style button sequence
+          #
+          # MAIN : Cruise Main ON + APilot/Lateral engage only
+          # SET  : Current speed SET + LongControl ON
+          # RES  : Resume speed + LongControl ON
+
+          main_engage = any(
+            b.type == ButtonType.altButton3 and not b.pressed
+            for b in CS.buttonEvents
+          )
+
+          set_engage = any(
+            b.type == ButtonType.decelCruise and not b.pressed
+            for b in CS.buttonEvents
+          )
+
+          res_engage = any(
+            b.type == ButtonType.accelCruise and not b.pressed
+            for b in CS.buttonEvents
+          )
+
           auto_engage_long = self.enableAutoEngage == 2
 
           self.enableAutoEngage = 0
@@ -615,14 +633,22 @@ class Controls:
             self.state = State.enabled
 
           self.current_alert_types.append(ET.ENABLE)
-          self.v_cruise_helper.initialize_v_cruise(CS)
 
-          # MAIN으로 APilot을 수동 engage한 경우 longitudinal도 동시에 ON.
-          # AutoEngage==2의 기존 longitudinal 자동활성 기능도 보존.
-          self.cruise_helper.longActiveUser = 1 if (manual_enable or auto_engage_long) else 0
-
-          if self.cruise_helper.longActiveUser > 0:
+          if main_engage:
+            # MAIN은 APilot/Lateral만 engage.
+            # 목표속도 SET 및 LongControl 활성은 하지 않는다.
+            self.cruise_helper.longActiveUser = 0
             self.cruise_helper.userCruisePaused = False
+
+          else:
+            # SET/RES 또는 기존 AutoEngage 경로.
+            self.v_cruise_helper.initialize_v_cruise(CS)
+
+            if set_engage or res_engage or auto_engage_long:
+              self.cruise_helper.longActiveUser = 1
+              self.cruise_helper.userCruisePaused = False
+            else:
+              self.cruise_helper.longActiveUser = 0
     
     # Check if openpilot is engaged and actuators are enabled
     self.enabled = self.state in ENABLED_STATES
