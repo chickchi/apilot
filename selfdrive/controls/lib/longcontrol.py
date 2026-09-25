@@ -649,11 +649,20 @@ class LongControl:
       self.lead_start_status and
       0.0 < self.lead_start_d < 25.0 and
       self.lead_start_v < 0.50 and
-      CS.vEgo < 5.0
+      CS.vEgo < 5.0 and
+      not CS.gasPressed
     )
 
-    if stopped_lead_observed:
+    # Driver GAS override:
+    # 운전자가 직접 가속페달을 밟으면 STOP latch/출발확인 상태를 즉시 해제한다.
+    if CS.gasPressed:
+      self.stop_lead_latch_timer = 0.0
+      self.stop_depart_confirm_timer = 0.0
+      self.stop_depart_confirmed = False
+
+    elif stopped_lead_observed:
       self.stop_lead_latch_timer = 0.75
+
     else:
       self.stop_lead_latch_timer = max(
         self.stop_lead_latch_timer -
@@ -673,6 +682,7 @@ class LongControl:
       v_target_1p8sec >
       self.CP.vEgoStarting and
       not CS.brakePressed and
+      not CS.gasPressed and
       not self.lead_source_changed
     )
 
@@ -823,6 +833,7 @@ class LongControl:
       LongCtrlState.stopping and
       self.stop_lead_latch_timer > 0.0 and
       not self.stop_depart_confirmed and
+      not CS.gasPressed and
       not CC.hudControl.softHold
     )
 
