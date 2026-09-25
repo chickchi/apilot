@@ -1029,10 +1029,14 @@ void DrawApilot::drawGapInfo(const UIState* s, int x, int y) {
         ui_draw_text(s, x + dxGap + 20, y + 90, "GAP", 25, COLOR_WHITE, BOLD);
     }
     // 갭정보표시 중앙위
-    sprintf(str, "%d", gap1);
+    // GAP4는 AUTO이므로 숫자 4 대신 A로 표시
+    if (gap1 == 4) strcpy(str, "A");
+    else sprintf(str, "%d", gap1);
+
     if (s->show_gap_info >= 0) {
         ui_draw_text(s, x + dxGap + 15 + 60, y + 60, str, 50, COLOR_WHITE, BOLD);
     }
+
     static int _gap1 = 0;
     if (_gap1 != gap1) ui_draw_text_a(s, x + dxGap + 15 + 60, y + 60, str, 50, COLOR_WHITE, BOLD);
     _gap1 = gap1;
@@ -1851,23 +1855,40 @@ void DrawApilot::drawDebugText(UIState* s, bool show) {
     //int xRoadSignType = road_limit_speed.getXRoadSignType();
     //int xRoadLimitSpeed = road_limit_speed.getXRoadLimitSpeed();
 
-    auto lateralPlan = sm["lateralPlan"].getLateralPlan();
-    float laneWidth = lateralPlan.getLaneWidth();
-    int roadEdgeStat = lateralPlan.getRoadEdgeStat();
-    QString latDebugText = QString::fromStdString(lateralPlan.getLatDebugText());
-
-
-    //sprintf(str, "Mappy: Turn(%d,%d), Spd(%d,%d),Sign(%d), Road(%d,%d), LW:%.1f", xTurnInfo, xDistToTurn, xSpdDist, xSpdLimit, xSignType, xRoadSignType, xRoadLimitSpeed, laneWidth);
-    //y += dy;
-    ui_draw_text(s, text_x, y, str, 35, COLOR_WHITE, BOLD, 0.0f, 0.0f);
-    sprintf(str, "LW:%.1f, Edge(%d), %s", laneWidth, roadEdgeStat, latDebugText.toStdString().c_str());
-    y += dy;
-    ui_draw_text(s, text_x, y, str, 35, COLOR_WHITE, BOLD, 0.0f, 0.0f);
-
-    //p.drawText(text_x, y + 160, QString::fromStdString(controls_state.getDebugText2().cStr()));
-    //p.drawText(text_x, y + 240, QString::fromStdString(controls_state.getDebugText1().cStr()));
-
+    // STOP / LEAD DIAGNOSTICS
+    // 기존 LW / Edge 디버그 대신 정차 문제 분석용 정보를 표시한다.
     auto car_control = sm["carControl"].getCarControl();
+    auto car_state = sm["carState"].getCarState();
+    auto lead = sm["radarState"].getRadarState().getLeadOne();
+
+    const char *lead_src = !lead.getStatus() ? "-" : (lead.getRadar() ? "R" : "V");
+
+    sprintf(str,
+            "STOP ST%d SRC%s EV%.1f AC%.2f D%.1f VL%.2f VR%+.2f",
+            static_cast<int>(controls_state.getLongControlState()),
+            lead_src,
+            car_state.getVEgo() * MS_TO_KPH,
+            car_control.getActuators().getAccel(),
+            lead.getStatus() ? lead.getDRel() : 0.0f,
+            lead.getStatus() ? lead.getVLead() : 0.0f,
+            lead.getStatus() ? lead.getVRel() : 0.0f);
+    y += dy;
+    ui_draw_text(s, text_x, y, str, 31, COLOR_WHITE, BOLD, 0.0f, 0.0f);
+
+    char gap_label[8];
+    if (controls_state.getLongCruiseGap() == 4) strcpy(gap_label, "A");
+    else sprintf(gap_label, "%d", controls_state.getLongCruiseGap());
+
+    sprintf(str,
+            "PLAN GAP%s TF%.2f X%d SOFT%d BRK%d",
+            gap_label,
+            lp.getTFollow(),
+            static_cast<int>(lp.getXState()),
+            car_control.getHudControl().getSoftHold() ? 1 : 0,
+            car_state.getBrakeLights() ? 1 : 0);
+    y += dy;
+    ui_draw_text(s, text_x, y, str, 31, COLOR_WHITE, BOLD, 0.0f, 0.0f);
+
     qstr = QString::fromStdString(car_control.getDebugTextCC().cStr());
     y += dy;
     ui_draw_text(s, text_x, y, qstr.toStdString().c_str(), 35, COLOR_WHITE, BOLD, 0.0f, 0.0f);
