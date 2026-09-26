@@ -868,7 +868,7 @@ class CruiseHelper:
         longActiveUser,v_cruise_kph = self.check_gas_cruise_on(CS, v_cruise_kph)
       elif not brakePressed and self.preBrakePressed:
         longActiveUser,v_cruise_kph = self.check_brake_cruise_on(CS, v_cruise_kph)
-      elif self.userCruisePaused:
+      elif self.auto_cruise_control and self.userCruisePaused:
         if self.v_ego_kph > 3.0 and self.dRel > 0 and self.vRel < 0:          
           v_cruise_kph = self.v_ego_kph_set
           longActiveUser = 3
@@ -877,7 +877,7 @@ class CruiseHelper:
           longActiveUser = 3
         pass
 
-      if longActiveUser <= 0 and not brakePressed and not CS.gasPressed:
+      if self.auto_cruise_control and longActiveUser <= 0 and not brakePressed and not CS.gasPressed:
         cruiseOnDist = abs(self.cruiseOnDist)
         if cruiseOnDist > 0.0 and CS.vEgo > 0.2 and self.vRel < 0 and self.dRel < cruiseOnDist:
           self.send_apilot_event(controls, EventName.stopStop, 10.0)
