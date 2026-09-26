@@ -639,6 +639,7 @@ class Controls:
             # 목표속도 SET 및 LongControl 활성은 하지 않는다.
             self.cruise_helper.longActiveUser = 0
             self.cruise_helper.userCruisePaused = False
+            self.cruise_helper.auto_cruise_control = False
 
           else:
             # SET/RES 또는 기존 AutoEngage 경로.
