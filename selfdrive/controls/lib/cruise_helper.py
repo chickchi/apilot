@@ -16,32 +16,42 @@ from common.filter_simple import StreamingMovingAverage
 from cereal import log
 
 
+
+
 from selfdrive.road_speed_limiter import road_speed_limiter_get_max_speed, road_speed_limiter_get_active, \
   get_road_speed_limiter
 #import common.loger as trace1
 
+
 CREEP_SPEED = 2.3
 SYNC_MARGIN = 3.
+
 
 # do not modify
 MIN_SET_SPEED_KPH = V_CRUISE_MIN
 MAX_SET_SPEED_KPH = V_CRUISE_MAX
+
 
 ALIVE_COUNT = [6, 8]
 WAIT_COUNT = [12, 13, 14, 15, 16]
 AliveIndex = 0
 WaitIndex = 0
 
+
 MIN_CURVE_SPEED = 20. * CV.KPH_TO_MS
 
+
 EventName = car.CarEvent.EventName
+
 
 ButtonType = car.CarState.ButtonEvent.Type
 ButtonPrev = ButtonType.unknown
 ButtonCnt = 0
 LongPressed = False
 
+
 XState = log.LongitudinalPlan.XState
+
 
 ## 국가법령정보센터: 도로설계기준
 V_CURVE_LOOKUP_BP = [0., 1./800., 1./670., 1./560., 1./440., 1./360., 1./265., 1./190., 1./135., 1./85., 1./55., 1./30., 1./15.]
@@ -49,7 +59,10 @@ V_CURVE_LOOKUP_BP = [0., 1./800., 1./670., 1./560., 1./440., 1./360., 1./265., 1
 V_CRUVE_LOOKUP_VALS = [300, 150, 120, 110, 100, 90, 80, 70, 60, 50, 45, 35, 30]
 
 
+
+
 class CruiseHelper:
+
 
   def __init__(self):
     self.mapValid = 0
@@ -87,8 +100,10 @@ class CruiseHelper:
     self.turnSpeed_prev = 300
     self.cruiseSpeedTarget = 0
 
+
     self.active_cam = False
     self.over_speed_limit = False
+
 
     self.roadLimitSpeed = None
     self.ndaActive = 0
@@ -97,15 +112,20 @@ class CruiseHelper:
     self.apilotEventPrev = 0
     self.drivingModeIndex = 0.0
 
+
     self.leadCarSpeed = 0.
 
+
     self.xIndex = 0
+
 
     self.update_params_count = 0
     self.curvatureFilter = StreamingMovingAverage(20)
 
+
     self.longCruiseGap = clip(int(Params().get("PrevCruiseGap")), 1, 4)
     self.cruiseSpeedMin = int(Params().get("CruiseSpeedMin"))
+
 
     self.autoCurveSpeedCtrlUse = int(Params().get("AutoCurveSpeedCtrlUse"))
     self.autoCurveSpeedFactor = float(int(Params().get("AutoCurveSpeedFactor", encoding="utf8")))*0.01
@@ -149,10 +169,12 @@ class CruiseHelper:
     self.lateralTorqueCustom = Params().get_bool("LateralTorqueCustom")
     self.auto_cruise_control = True
 
+
   def update_params(self, frame):
     if frame % 20 == 0:
       self.update_params_count += 1
       self.update_params_count = self.update_params_count % 20
+
 
       if self.update_params_count == 0:
         self.autoCurveSpeedCtrlUse = int(Params().get("AutoCurveSpeedCtrlUse"))
@@ -219,14 +241,18 @@ class CruiseHelper:
       elif self.update_params_count == 17:
         self.steerRatioApply = float(int(Params().get("SteerRatioApply", encoding="utf8"))) / 10.
 
+
   @staticmethod
   def get_lead(sm):
+
 
     radar = sm['radarState']
     if radar.leadOne.status: # and radar.leadOne.radar:
       return radar.leadOne
 
+
     return None
+
 
 # ajouatom
 # navi 운영방법
@@ -244,9 +270,13 @@ class CruiseHelper:
 #   - 엑셀을 밟으면: 30Km/h이상되면 auto Resume
 #   - 엑셀을 밟았다 떼면: zz
 
+
   def cruise_control(self, controls, CS, active_mode, v_cruise_kph):  #active_mode => -3(OFF auto), -2(OFF brake), -1(OFF user), 0(OFF), 1(ON user), 2(ON gas), 3(ON auto)
     if controls.enabled:
-      if active_mode > 0 and controls.CC.longEnabled:
+      # v1.8.2: active_mode is the SET/RES/auto-resume intent.
+      # controls.CC.longEnabled is the previous CarControl frame and is
+      # intentionally False in MAIN-only mode, so it must not gate bootstrap.
+      if active_mode > 0:
         if self.longActiveUser <= 0:
           controls.LoC.reset(v_pid=CS.vEgo)
         if self.longControlActiveSound >= 2 and self.longActiveUser != active_mode:
@@ -255,6 +285,7 @@ class CruiseHelper:
         self.userCruisePaused = False
         self.auto_cruise_control = True
 
+
       elif active_mode <= 0:
         if self.longActiveUser > 0:
           self.v_cruise_kph_backup = v_cruise_kph
@@ -262,9 +293,11 @@ class CruiseHelper:
             controls.events.add(EventName.cruisePaused)
         self.longActiveUser = active_mode
 
+
   @staticmethod
   def pcmCruiseControl(v_cruise_kph_last, v_cruise_kph):
     pass
+
 
   def get_lead_rel(self, controls):    
     lead = self.get_lead(controls.sm)
@@ -272,11 +305,14 @@ class CruiseHelper:
     vRel = lead.vRel if lead is not None else 0
     return dRel, vRel
 
+
   def update_cruise_buttons(self, enabled, controls, CS, buttonEvents, v_cruise_kph, metric):
     global ButtonCnt, LongPressed, ButtonPrev
 
+
     button_speed_up_diff = 1
     button_speed_dn_diff = 10 if self.cruiseButtonMode in [3, 4] else 1
+
 
     button_type = 0
     if enabled:
@@ -301,6 +337,7 @@ class CruiseHelper:
             put_nonblocking("PrevCruiseGap", str(self.longCruiseGap))
             button_type = ButtonType.gapAdjustCruise
 
+
           LongPressed = False
           ButtonCnt = 0
       if ButtonCnt > 40:
@@ -324,7 +361,9 @@ class CruiseHelper:
     v_cruise_kph = clip(v_cruise_kph, self.cruiseSpeedMin, MAX_SET_SPEED_KPH)
     return button_type, LongPressed, v_cruise_kph
 
+
   def decelerate_for_speed_camera(self, safe_speed, safe_dist, current_speed, decel_rate, left_dist):
+
 
     if left_dist <= safe_dist:
       return safe_speed
@@ -335,17 +374,20 @@ class CruiseHelper:
     apply_speed = max(apply_speed, min_speed)
     return apply_speed
 
+
   def update_speed_apilot(self, CS, controls):
     v_ego = CS.vEgoCluster
     msg = self.roadLimitSpeed = controls.sm['roadLimitSpeed']
     apTbtSpeed = controls.sm['lateralPlan'].apNaviSpeed
     apTbtDistance = controls.sm['lateralPlan'].apNaviDistance
 
+
     active = msg.active
     self.ndaActive = 1 if active > 0 else 0
     roadSpeed = clip(30, msg.roadLimitSpeed, MAX_SET_SPEED_KPH)
     camType = int(msg.camType)
     xSignType = msg.xSignType
+
 
     isSpeedBump = False
     isSectionLimit = False
@@ -357,6 +399,7 @@ class CruiseHelper:
     if camType == 22 or xSignType == 22:
       safeSpeed = self.autoNaviSpeedBumpSpeed
       isSpeedBump = True
+
 
     if msg.xSpdLimit > 0 and msg.xSpdDist > 0:
       safeSpeed = msg.xSpdLimit if safeSpeed <= 0 else safeSpeed
@@ -375,13 +418,16 @@ class CruiseHelper:
       leftDist = CS.speedLimitDistance
       speedLimitType = 2 if leftDist > 1 else 3
 
+
     if isSpeedBump:
       speedLimitType = 1 
       safeDist = self.autoNaviSpeedBumpDist
     elif safeSpeed>0 and leftDist>0:
       safeDist = self.autoNaviSpeedCtrlEnd * v_ego
 
+
     safeSpeed *= self.autoNaviSpeedSafetyFactor
+
 
     log = ""
     if isSectionLimit:
@@ -390,6 +436,7 @@ class CruiseHelper:
       applySpeed = self.decelerate_for_speed_camera(safeSpeed/3.6, safeDist, self.v_cruise_kph_apply/3.6, self.autoNaviSpeedDecelRate, leftDist) * 3.6
     else:
       applySpeed = 255
+
 
     ## NOO Helper
     if apTbtSpeed > 0 and apTbtDistance > 0:
@@ -402,6 +449,7 @@ class CruiseHelper:
         safeDist = safeTbtDist
         speedLimitType = 4
 
+
     ## NOO Helper-End
       
     log = "{:.1f}<{:.1f}/{:.1f} B{} A{:.1f}/{:.1f} N{:.1f}/{:.1f} C{:.1f}/{:.1f} V{:.1f}/{:.1f} ".format(
@@ -411,8 +459,10 @@ class CruiseHelper:
                   CS.speedLimit, CS.speedLimitDistance,
                   apTbtSpeed, apTbtDistance)
 
+
     controls.debugText1 = log
     return applySpeed, roadSpeed, leftDist, speedLimitType
+
 
   def update_speed_nda(self, CS, controls):
     clu11_speed = CS.vEgoCluster * CV.MS_TO_KPH
@@ -423,9 +473,12 @@ class CruiseHelper:
     apply_limit_speed, road_limit_speed, left_dist, first_started, max_speed_log = \
       road_speed_limiter.get_max_speed(CS, clu11_speed, True, apNaviSpeed, apNaviDistance) #self.is_metric)
 
+
     controls.debugText1 = max_speed_log
 
+
     self.active_cam = road_limit_speed > 0 and left_dist > 0
+
 
     if road_speed_limiter.roadLimitSpeed is not None:
       camSpeedFactor = clip(road_speed_limiter.roadLimitSpeed.camSpeedFactor, 1.0, 1.1)
@@ -434,11 +487,14 @@ class CruiseHelper:
     else:
       self.over_speed_limit = False
 
+
     #str1 = 'applyLimit={},speedLimit={},leftDist={}'.format(apply_limit_speed, road_limit_speed, left_dist)
     #controls.debugText1 = str1
     roadSpeed = controls.sm['roadLimitSpeed'].roadLimitSpeed
 
+
     return clip(apply_limit_speed, 0, MAX_SET_SPEED_KPH), clip(roadSpeed, 30, MAX_SET_SPEED_KPH), left_dist, 2
+
 
   def apilot_driving_mode(self, CS, controls):
     accel_index = interp(CS.aEgo, [-3.0, -1.0, 0.0, 1.0, 3.0], [100.0, 0, 0, 0, 100.0])
@@ -449,6 +505,7 @@ class CruiseHelper:
       total_index = 0
     self.drivingModeIndex = self.drivingModeIndex * 0.999 + total_index * 0.001
 
+
     if self.initMyDrivingMode == 5 and self.drivingModeIndex > 0:
       if self.myDrivingMode in [2,4]:
         pass
@@ -456,6 +513,7 @@ class CruiseHelper:
         self.myDrivingMode = 3 #일반
       elif self.drivingModeIndex > 80:
         self.myDrivingMode = 1 #연비
+
 
   def apilot_curve(self, CS, controls):
     # 회전속도를 선속도 나누면 : 곡률이 됨. [20]은 약 4초앞의 곡률을 보고 커브를 계산함.
@@ -473,11 +531,13 @@ class CruiseHelper:
     else:
       turnSpeed = 300
 
+
     self.turnSpeed_prev = turnSpeed
     speed_diff = max(0, CS.vEgo*3.6 - turnSpeed)
     turnSpeed = turnSpeed - speed_diff * self.autoCurveSpeedFactorIn
     controls.debugText2 = 'CURVE={:5.1f},curvature={:5.4f},mode={:3.1f}'.format(self.turnSpeed_prev, curvature, self.drivingModeIndex)
     return turnSpeed
+
 
   def apilot_curve_old(self, CS, controls):
     curvatures = controls.sm['lateralPlan'].curvatures
@@ -494,9 +554,11 @@ class CruiseHelper:
     else:
       self.curvatureFilter.set(0.0)
 
+
     #controls.debugText1 = 'CURVE={:5.1f},curvature={:5.4f}'.format(turnSpeed, curvature)
     self.turnSpeed_prev = turnSpeed
     return turnSpeed
+
 
   def v_cruise_speed_up(self, v_cruise_kph, roadSpeed):
     if v_cruise_kph < roadSpeed:
@@ -508,6 +570,7 @@ class CruiseHelper:
           break
     return clip(v_cruise_kph, self.cruiseSpeedMin, MAX_SET_SPEED_KPH)
 
+
   def send_apilot_event(self, controls, eventName, waiting = 20):
     #if eventName != self.apilotEventPrev or (controls.sm.frame - self.apilotEventFrame)*DT_CTRL > self.apilotEventWait: 
     if (controls.sm.frame - self.apilotEventFrame)*DT_CTRL > self.apilotEventWait: # 시끄러..
@@ -515,6 +578,7 @@ class CruiseHelper:
        self.apilotEventFrame = controls.sm.frame
        self.apilotEventPrev = eventName
        self.apilotEventWait = waiting
+
 
   ######################
   # Gas(엑셀) 밟고 있거나, 놓는 시점
@@ -531,6 +595,7 @@ class CruiseHelper:
   def check_gas_cruise_on(self, CS, v_cruise_kph):
     longActiveUser = self.longActiveUser
     resume_cond = abs(CS.steeringAngleDeg) < 20 # and not CS.steeringPressed
+
 
     # softHold상태: cruiseOFF: 엑셀로 밟으면 크루즈해제
     if self.xState == XState.softHold:
@@ -603,7 +668,10 @@ class CruiseHelper:
       if self.autoResumeFromGasSpeed < self.v_ego_kph_set: # < self.autoSyncCruiseSpeedMax: # 오토크루즈 ON속도보다 높고, 130키로보다 작을때만 싱크
         v_cruise_kph = self.v_ego_kph_set if self.v_ego_kph_set < self.autoSyncCruiseSpeedMax else self.autoSyncCruiseSpeedMax
 
+
     return longActiveUser, v_cruise_kph
+
+
 
 
   #########################
@@ -630,6 +698,7 @@ class CruiseHelper:
   def check_brake_cruise_on(self, CS, v_cruise_kph):
     longActiveUser = self.longActiveUser
     resume_cond = abs(CS.steeringAngleDeg) < 20 # and not CS.steeringPressed
+
 
     # 정지상태, 소프트홀드일때 크루즈 ON
     if self.v_ego_kph < 5.0 and self.xState == XState.softHold and self.auto_cruise_control:
@@ -671,11 +740,14 @@ class CruiseHelper:
             longActiveUser = 3
             v_cruise_kph = self.v_ego_kph_set
 
+
     return longActiveUser, v_cruise_kph
+
 
   def button_control(self, enabled, controls, CS, v_cruise_kph, buttonEvents, metric):
     button,buttonLong,buttonSpeed = self.update_cruise_buttons(enabled, controls,CS,  buttonEvents, v_cruise_kph, metric)
     longActiveUser = self.longActiveUser
+
 
     ##### Cruise Button 처리...
     if buttonLong:
@@ -728,14 +800,18 @@ class CruiseHelper:
             else:
               v_cruise_kph = buttonSpeed
 
+
     return longActiveUser, v_cruise_kph
 
+
   def cruise_control_speed(self, controls, CS, v_cruise_kph):
+
 
     #self.cruiseControlMode : 가상의 초과속도를 말함.
     v_cruise_kph_apply = v_cruise_kph    
     if self.cruiseControlMode > 0:
       if self.longActiveUser > 0:
+
 
         if self.cruiseSpeedTarget > 0:  # 작동중일때 크루즈 설정속도 변화감지.
           if self.cruiseSpeedTarget < v_cruise_kph:  # 설정속도가 빨라지면..
@@ -745,6 +821,7 @@ class CruiseHelper:
         elif self.cruiseSpeedTarget == 0 and self.v_ego_kph + 3 < v_cruise_kph and v_cruise_kph > 20.0:  # 주행중 속도가 떨어지면 다시 크루즈연비제어 시작.
           self.cruiseSpeedTarget = v_cruise_kph
 
+
         if self.cruiseSpeedTarget != 0:  ## 크루즈 연비 제어모드 작동중일때: 연비제어 종료지점
           if self.v_ego_kph > self.cruiseSpeedTarget: # 설정속도를 초과하면..
             self.cruiseSpeedTarget = 0
@@ -753,11 +830,14 @@ class CruiseHelper:
       else:
         self.cruiseSpeedTarget = 0
 
+
     return v_cruise_kph_apply
+
 
   def update_apilot_cmd(self, controls, v_cruise_kph, longActiveUser):
     msg = controls.sm['roadLimitSpeed']
     #print(msg.xCmd, msg.xArg, msg.xIndex)
+
 
     if msg.xIndex > 0 and msg.xIndex != self.xIndex:
       self.xIndex = msg.xIndex
@@ -793,10 +873,12 @@ class CruiseHelper:
         pass
     return v_cruise_kph, longActiveUser
 
+
   def update_v_cruise_apilot(self, v_cruise_kph, buttonEvents, enabled, metric, controls, CS):
     longActiveUser = self.longActiveUser
     self.frame = controls.sm.frame
     self.update_params(self.frame)
+
 
     if self.autoNaviSpeedCtrlMode == 1:
       self.naviSpeed, self.roadSpeed, leftSpeedDist, speedLimitType = self.update_speed_apilot(CS, controls)
@@ -807,6 +889,7 @@ class CruiseHelper:
     self.apilot_driving_mode(CS, controls)
     if self.autoCurveSpeedCtrlUse > 0:
       self.curveSpeed = self.apilot_curve(CS, controls)
+
 
     self.v_ego_kph = int(CS.vEgoCluster * CV.MS_TO_KPH + 0.5)
     self.v_ego_kph_set = clip(self.v_ego_kph, self.cruiseSpeedMin, MAX_SET_SPEED_KPH)
@@ -845,19 +928,25 @@ class CruiseHelper:
       #  self.send_apilot_event(controls, EventName.trafficError, 20.0)
 
 
+
+
     self.mpcEvent_prev = mpcEvent
     self.trafficState = trafficState
     self.dRel = dRel
     self.vRel = vRel
     self.radarAlarmCount = self.radarAlarmCount - 1 if self.radarAlarmCount > 0 else 0
 
+
     self.blinker = CS.rightBlinker or CS.leftBlinker
+
 
     brakePressed = CS.brakePressed or CS.regenBraking
     longActiveUser, v_cruise_kph = self.button_control(enabled, controls, CS, v_cruise_kph, buttonEvents, metric)
 
+
     v_cruise_kph, longActiveUser = self.update_apilot_cmd(controls, v_cruise_kph, longActiveUser)
     if controls.enabled:      
+
 
       if brakePressed:
         longActiveUser = -2
@@ -877,6 +966,7 @@ class CruiseHelper:
           longActiveUser = 3
         pass
 
+
       if self.auto_cruise_control and longActiveUser <= 0 and not brakePressed and not CS.gasPressed:
         cruiseOnDist = abs(self.cruiseOnDist)
         if cruiseOnDist > 0.0 and CS.vEgo > 0.2 and self.vRel < 0 and self.dRel < cruiseOnDist:
@@ -884,11 +974,15 @@ class CruiseHelper:
           if self.cruiseOnDist > 0.0:
             longActiveUser = 3
 
+
       self.cruise_control(controls, CS, longActiveUser, v_cruise_kph)
+
+
 
 
       ###### 크루즈 속도제어~~~
       self.v_cruise_kph_apply = self.cruise_control_speed(controls, CS, v_cruise_kph)
+
 
       ###### leadCar 관련 속도처리
       roadSpeed1 = self.roadSpeed * self.autoSpeedUptoRoadSpeedLimit
@@ -902,6 +996,7 @@ class CruiseHelper:
         if leadCarSpeed1 < v_cruise_kph:
           self.v_cruise_kph_apply = leadCarSpeed1
       #controls.debugText1 = 'LC={:3.1f},{:3.1f},RS={:3.1f},SS={:3.1f}'.format( self.leadCarSpeed, vRel*CV.MS_TO_KPH, self.roadSpeed, self.v_cruise_kph_apply)      
+
 
       ###### naviSpeed, roadSpeed, curveSpeed처리
       applySpeedLimit = False
@@ -928,12 +1023,14 @@ class CruiseHelper:
         else:
           self.v_cruise_kph_apply = min(self.v_cruise_kph_apply, self.curveSpeed)
 
+
     self.preBrakePressed = brakePressed
     self.xState_prev = self.xState
     if self.v_ego_kph < 20.0:
       self.slowSpeedFrameCount += 1
     else:
       self.slowSpeedFrameCount = 0
+
 
     if CS.gasPressed:
       self.gasPressedFrame = self.frame
@@ -945,6 +1042,7 @@ class CruiseHelper:
       self.preGasPressedMax = 0.0
       self.gasPressedCount = 0
     return v_cruise_kph
+
 
 def enable_radar_tracks(CP, logcan, sendcan):
   # START: Try to enable radar tracks
@@ -978,4 +1076,3 @@ def enable_radar_tracks(CP, logcan, sendcan):
         print("Failed to enable tracks" + str(e))
   print("END Try to enable radar tracks")
   # END try to enable radar tracks
-
