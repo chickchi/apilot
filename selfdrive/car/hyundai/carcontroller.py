@@ -12,8 +12,12 @@ from common.params import Params
 from selfdrive.swaglog import cloudlog
 
 
+
+
 VisualAlert = car.CarControl.HUDControl.VisualAlert
 LongCtrlState = car.CarControl.Actuators.LongControlState
+
+
 
 
 # EPS faults if you apply torque while the steering angle is above 90 degrees for more than 1 second
@@ -25,8 +29,14 @@ MAX_ANGLE_CONSECUTIVE_FRAMES = 2
 
 
 
+
+
+
+
 def process_hud_alert(enabled, fingerprint, hud_control):
   sys_warning = (hud_control.visualAlert in (VisualAlert.steerRequired, VisualAlert.ldw))
+
+
 
 
   # initialize to no line visible
@@ -40,6 +50,8 @@ def process_hud_alert(enabled, fingerprint, hud_control):
     sys_state = 6
 
 
+
+
   # initialize to no warnings
   left_lane_warning = 0
   right_lane_warning = 0
@@ -49,7 +61,13 @@ def process_hud_alert(enabled, fingerprint, hud_control):
     right_lane_warning = 1 if fingerprint in (CAR.GENESIS_G90, CAR.GENESIS_G80) else 2
 
 
+
+
   return sys_warning, sys_state, left_lane_warning, right_lane_warning
+
+
+
+
 
 
 
@@ -61,6 +79,8 @@ class CarController:
     self.packer = CANPacker(dbc_name)
     self.angle_limit_counter = 0
     self.frame = 0
+
+
 
 
     self.accel_last = 0
@@ -83,6 +103,8 @@ class CarController:
     self.jerk_count = 0
 
 
+
+
     # for Legacy mode car auto resume (DH etc, not tested)
     self.resume_cnt = 0
     self.resume_wait_timer = 0
@@ -90,9 +112,13 @@ class CarController:
     self.button_alive_frame = 0
 
 
+
+
   def update(self, CC, CS):
     actuators = CC.actuators
     hud_control = CC.hudControl
+
+
 
 
     # steering torque
@@ -102,15 +128,23 @@ class CarController:
     apply_steer = apply_driver_steer_torque_limits(new_steer, self.apply_steer_last, CS.out.steeringTorque, self.params)
 
 
+
+
     if not CC.latActive:
       apply_steer = 0
+
+
 
 
     self.apply_steer_last = apply_steer
 
 
+
+
     # accel + longitudinal
     accel = clip(actuators.accel, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX)
+
+
 
 
     # v1.5.6 hardware-adjacent cruise-speed fail-safe.
@@ -132,8 +166,12 @@ class CarController:
         accel = min(accel, controller_guard_cap)
 
 
+
+
     stopping = actuators.longControlState == LongCtrlState.stopping
     set_speed_in_units = hud_control.setSpeed * (CV.MS_TO_KPH if CS.is_metric else CV.MS_TO_MPH)
+
+
 
 
     # HUD messages
@@ -141,10 +179,14 @@ class CarController:
                                                                                       hud_control)
 
 
+
+
     if CC.activeHda == 2 and self.speedCameraHapticEndFrame < 0: # 과속카메라 감속시작
       self.speedCameraHapticEndFrame = self.frame + (8.0 / DT_CTRL)  #6초간 켜줌..
     elif CC.activeHda != 2:
       self.speedCameraHapticEndFrame = -1
+
+
 
 
     if self.frame < self.speedCameraHapticEndFrame and self.hapticFeedbackWhenSpeedCamera>0:
@@ -158,9 +200,13 @@ class CarController:
       self.blinking_signal = False
 
 
+
+
     jerk = actuators.jerk
     #jerk = accel - self.accel_last
     can_sends = []
+
+
 
 
     # *** common hyundai stuff ***
@@ -173,12 +219,16 @@ class CarController:
       self.steerDeltaDown = int(Params().get("SteerDeltaDown", encoding="utf8"))
 
 
+
+
     # tester present - w/ no response (keeps relevant ECU disabled)
     if self.frame % 100 == 0 and not (self.CP.flags & HyundaiFlags.CANFD_CAMERA_SCC.value) and self.CP.openpilotLongitudinalControl:
       addr, bus = 0x7d0, 0
       if self.CP.flags & HyundaiFlags.CANFD_HDA2.value:
         addr, bus = 0x730, 5
       can_sends.append([addr, 0, b"\x02\x3E\x80\x00\x00\x00\x00\x00", bus])
+
+
 
 
     # >90 degree steering fault prevention
@@ -189,13 +239,19 @@ class CarController:
       self.angle_limit_counter = 0
 
 
+
+
     # Cut steer actuation bit for two frames and hold torque with induced temporary fault
     torque_fault = CC.latActive and self.angle_limit_counter > self.maxAngleFrames
     lat_active = CC.latActive and not torque_fault
 
 
+
+
     if self.angle_limit_counter >= self.maxAngleFrames + MAX_ANGLE_CONSECUTIVE_FRAMES:
       self.angle_limit_counter = 0
+
+
 
 
     # CAN-FD platforms
@@ -204,8 +260,12 @@ class CarController:
       hda2_long = hda2 and self.CP.openpilotLongitudinalControl
 
 
+
+
       # steering control
       can_sends.extend(hyundaicanfd.create_steering_messages(self.packer, self.CP, CC.enabled, lat_active, apply_steer))
+
+
 
 
       # disable LFA on HDA2
@@ -213,9 +273,13 @@ class CarController:
         can_sends.append(hyundaicanfd.create_cam_0x2a4(self.packer, CS.cam_0x2a4))
 
 
+
+
       # LFA and HDA icons
       if self.frame % 5 == 0 and (not hda2 or hda2_long):
         can_sends.append(hyundaicanfd.create_lfahda_cluster(self.packer, self.CP, CC.enabled))
+
+
 
 
       if self.CP.openpilotLongitudinalControl:
@@ -239,6 +303,8 @@ class CarController:
               self.last_button_frame = self.frame
 
 
+
+
           # cruise standstill resume
           elif CC.cruiseControl.resume:
             if self.CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS:
@@ -253,6 +319,8 @@ class CarController:
                                                 torque_fault, CS.lkas11, sys_warning, sys_state, CC.enabled,
                                                 hud_control.leftLaneVisible, hud_control.rightLaneVisible,
                                                 left_lane_warning, right_lane_warning))
+
+
 
 
       if not self.CP.openpilotLongitudinalControl:
@@ -281,6 +349,8 @@ class CarController:
           self.resume_cnt = 0
           target = int(set_speed_in_units+0.5)
           current = int(CS.out.cruiseState.speed*CV.MS_TO_KPH + 0.5)
+
+
 
 
           #CC.debugTextCC = "BTN:00,T:{:.1f},C:{:.1f},{},{}".format(target, current, self.wait_timer, self.alive_timer)
@@ -313,11 +383,17 @@ class CarController:
             self.button_alive_frame = self.frame
 
 
+
+
       #CC.debugTextCC = "230206"
+
+
 
 
       if self.CP.carFingerprint in (CAR.GENESIS_G90_2019, CAR.GENESIS_G90, CAR.K7):
         can_sends.append(hyundaican.create_mdps12(self.packer, self.frame, CS.mdps12))
+
+
 
 
       if self.frame % 2 == 0 and self.CP.openpilotLongitudinalControl:
@@ -344,6 +420,8 @@ class CarController:
           cb_lower = clip(0.8 + accel * 0.2, 0, 1.2)
 
 
+
+
         # v1.7.0: 2 Hz transmit-boundary trace.  This is logging only; it sends
         # no extra CAN message.  Comparing SRC/TX with [GEAR_CTL] proves whether
         # a recovery ceiling actually reached the Hyundai SCC command path.
@@ -362,16 +440,23 @@ class CarController:
             pass
 
 
-        # v1.8.2: APilot MAIN-only keeps lateral enabled but Hyundai SCC
-        # longitudinal must stay disabled until SET/RES actually enables Long.
-        can_sends.extend(hyundaican.create_acc_commands_mix_scc(self.CP, self.packer, CC.longEnabled, accel, jerk_u, jerk_l, int(self.frame / 2),
+
+
+        # v1.8.3: keep Hyundai SCC MAIN armed whenever APilot is enabled.
+        # Actual longitudinal actuation is still gated inside hyundaican by
+        # CC.longEnabled / CC.longActive, so MAIN-only sends no acceleration.
+        can_sends.extend(hyundaican.create_acc_commands_mix_scc(self.CP, self.packer, CC.enabled, accel, jerk_u, jerk_l, int(self.frame / 2),
                                                       hud_control, set_speed_in_units, stopping, CC, CS, self.softHoldMode, cb_upper, cb_lower))
         self.accel_last = accel
+
+
 
 
       # 20 Hz LFA MFA message
       if self.frame % 5 == 0 and self.CP.flags & HyundaiFlags.SEND_LFA.value:
         can_sends.append(hyundaican.create_lfahda_mfc(self.packer, CC, self.blinking_signal))
+
+
 
 
       # 5 Hz ACC options
@@ -382,14 +467,20 @@ class CarController:
           can_sends.append(hyundaican.create_acc_opt_copy(self.CP, CS, self.packer))
 
 
+
+
       # 2 Hz front radar options
       if self.frame % 50 == 0 and self.CP.openpilotLongitudinalControl  and self.CP.sccBus == 0:
         can_sends.append(hyundaican.create_frt_radar_opt(self.packer))
 
 
+
+
     new_actuators = actuators.copy()
     new_actuators.steer = apply_steer / self.params.STEER_MAX
     new_actuators.accel = accel
+
+
 
 
     self.frame += 1
