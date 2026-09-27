@@ -751,8 +751,27 @@ class CruiseHelper:
 
     ##### Cruise Button 처리...
     if buttonLong:
-      if button in [ButtonType.accelCruise, ButtonType.decelCruise]:
-        v_cruise_kph = buttonSpeed
+      # v1.8.4:
+      # MAIN-only 상태에서 SET/RES를 길게 눌러도 첫 입력은 반드시
+      # LongControl 활성 의도로 처리한다. 기존 코드는 buttonSpeed만
+      # 변경해서 목표속도 숫자는 바뀌지만 longActiveUser가 0으로
+      # 남을 수 있었다.
+      if button == ButtonType.accelCruise:
+        if self.longActiveUser <= 0:
+          longActiveUser = 1
+          v_cruise_kph = max(
+            v_cruise_kph,
+            self.v_cruise_kph_backup,
+            self.v_ego_kph_set,
+          )
+        else:
+          v_cruise_kph = buttonSpeed
+      elif button == ButtonType.decelCruise:
+        if self.longActiveUser <= 0:
+          longActiveUser = 1
+          v_cruise_kph = self.v_ego_kph_set
+        else:
+          v_cruise_kph = buttonSpeed
       elif button == ButtonType.gapAdjustCruise:  ##안먹네.... 나중에 보자~
         #myDrivingMode = int(Params().get("MyDrivingMode"))
         self.myDrivingMode = self.myDrivingMode + 1 if self.myDrivingMode < 4 else 1
