@@ -422,11 +422,42 @@ class CarController:
 
 
 
-        # v1.7.0: 2 Hz transmit-boundary trace.  This is logging only; it sends
-        # no extra CAN message.  Comparing SRC/TX with [GEAR_CTL] proves whether
-        # a recovery ceiling actually reached the Hyundai SCC command path.
-        if self.frame % 50 == 0:
+        # v1.8.4: 5 Hz transmit-boundary + Hyundai SCC/button trace.
+        #
+        # AV/CE : CarState cruise available/enabled
+        # MB/CB : physical MAIN / RES-SET-GAP-CANCEL button state
+        # S11M  : received SCC11.MainMode_ACC
+        # S12A  : received SCC12.ACCMode
+        # GAS   : physical accelerator state
+        #
+        # This is diagnostic only; it sends no additional CAN message.
+        if self.frame % 20 == 0:
           try:
+            scc11_rx = getattr(CS, "scc11", None)
+            scc12_rx = getattr(CS, "scc12", None)
+
+            s11_main = (
+              int(scc11_rx.get("MainMode_ACC", -1))
+              if scc11_rx is not None
+              else -1
+            )
+            s12_acc = (
+              int(scc12_rx.get("ACCMode", -1))
+              if scc12_rx is not None
+              else -1
+            )
+
+            main_button = (
+              int(CS.main_buttons[-1])
+              if len(CS.main_buttons) > 0
+              else -1
+            )
+            cruise_button = (
+              int(CS.cruise_buttons[-1])
+              if len(CS.cruise_buttons) > 0
+              else -1
+            )
+
             cloudlog.info(
               f"[GEAR_TX] G={int(getattr(CS.out, 'currentGear', 0))}>"
               f"{int(getattr(CS.out, 'targetGear', 0))} "
@@ -434,7 +465,12 @@ class CarController:
               f"SRC={float(actuators.accel):.2f} TX={float(accel):.2f} "
               f"AE={float(CS.out.aEgo):.2f} "
               f"EN={int(CC.enabled)} LE={int(CC.longEnabled)} "
-              f"LA={int(CC.longActive)} OV={int(CC.cruiseControl.override)}"
+              f"LA={int(CC.longActive)} OV={int(CC.cruiseControl.override)} "
+              f"AV={int(CS.out.cruiseState.available)} "
+              f"CE={int(CS.out.cruiseState.enabled)} "
+              f"MB={main_button} CB={cruise_button} "
+              f"S11M={s11_main} S12A={s12_acc} "
+              f"GAS={int(CS.out.gasPressed)}"
             )
           except Exception:
             pass
