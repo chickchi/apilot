@@ -310,14 +310,6 @@ class CruiseHelper:
     global ButtonCnt, LongPressed, ButtonPrev
 
 
-    # v1.8.5: a completed CANCEL/disengage must not leak a partially tracked
-    # button press into the next APilot session.
-    if not enabled:
-      ButtonCnt = 0
-      LongPressed = False
-      ButtonPrev = ButtonType.unknown
-
-
     button_speed_up_diff = 1
     button_speed_dn_diff = 10 if self.cruiseButtonMode in [3, 4] else 1
 
@@ -755,37 +747,6 @@ class CruiseHelper:
   def button_control(self, enabled, controls, CS, v_cruise_kph, buttonEvents, metric):
     button,buttonLong,buttonSpeed = self.update_cruise_buttons(enabled, controls,CS,  buttonEvents, v_cruise_kph, metric)
     longActiveUser = self.longActiveUser
-
-
-    # v1.8.5: raw Hyundai button bootstrap.
-    #
-    # The 2026-09-28 road log proved that the physical SET press (CB=2)
-    # can be visible while the generated release event is occasionally
-    # missed.  In MAIN-only mode SET/RES is unambiguously a request to
-    # enable longitudinal control, so bootstrap on the physical press too.
-    #
-    # This does not change an already-active cruise target; it is only used
-    # while longActiveUser <= 0.
-    raw_cruise_button = (
-      int(CS.cruise_buttons[-1])
-      if len(CS.cruise_buttons) > 0
-      else Buttons.NONE
-    )
-
-
-    if enabled and self.longActiveUser <= 0:
-      if raw_cruise_button == Buttons.SET_DECEL:
-        longActiveUser = 1
-        v_cruise_kph = self.v_ego_kph_set
-        self.userCruisePaused = False
-      elif raw_cruise_button == Buttons.RES_ACCEL:
-        longActiveUser = 1
-        v_cruise_kph = max(
-          v_cruise_kph,
-          self.v_cruise_kph_backup,
-          self.v_ego_kph_set,
-        )
-        self.userCruisePaused = False
 
 
     ##### Cruise Button 처리...
