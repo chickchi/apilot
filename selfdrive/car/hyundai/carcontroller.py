@@ -112,6 +112,20 @@ class CarController:
     self.button_alive_frame = 0
 
 
+    # v1.8.5: classic CAN SCC-bus2 MAIN synchronization after CANCEL.
+    #
+    # A physical CANCEL disables APilot/ACC active state but the 2026-09-28
+    # log proved SCC11.MainMode_ACC remains 1.  The next physical MAIN then
+    # toggles OEM MAIN 1->0 while APilot interprets it as a new engage.
+    # Keep a very small one-shot state machine so CANCEL leaves both systems
+    # fully OFF.  At most two pulses are attempted and only while APilot is
+    # disabled, no steering-wheel cruise button is pressed, and received
+    # SCC11 MainMode_ACC is still 1.
+    self.main_sync_pending = False
+    self.main_sync_attempts = 0
+    self.main_sync_last_send_frame = -1000
+
+
 
 
   def update(self, CC, CS):
@@ -321,6 +335,105 @@ class CarController:
                                                 left_lane_warning, right_lane_warning))
 
 
+      # v1.8.5: synchronize OEM MAIN OFF after a physical CANCEL on the
+      # classic-CAN + SCC-bus2 longitudinal configuration.
+      #
+      # Safety properties:
+      # - never runs while APilot is enabled
+      # - never runs while MAIN/SET/RES/GAP/CANCEL is physically pressed
+      # - only acts when the received SCC11.MainMode_ACC is confirmed ON
+      # - one CLU11 MAIN pulse per attempt, maximum two attempts
+      # - a real physical MAIN press always cancels the pending injection
+      if self.CP.openpilotLongitudinalControl and self.CP.sccBus == 2:
+        scc11_main_sync = getattr(CS, "scc11", None)
+        main_mode_sync = (
+          int(scc11_main_sync.get("MainMode_ACC", -1))
+          if scc11_main_sync is not None
+          else -1
+        )
+
+
+        physical_cruise_button = (
+          int(CS.cruise_buttons[-1])
+          if len(CS.cruise_buttons) > 0
+          else Buttons.NONE
+        )
+        physical_main_button = (
+          int(CS.main_buttons[-1])
+          if len(CS.main_buttons) > 0
+          else 0
+        )
+
+
+        # CANCEL means full APilot OFF.  Remember that the OEM MAIN still
+        # needs to be turned OFF once the physical CANCEL button is released.
+        if physical_cruise_button == Buttons.CANCEL and main_mode_sync == 1:
+          self.main_sync_pending = True
+          self.main_sync_attempts = 0
+
+
+        # Driver MAIN input always has priority over synthetic synchronization.
+        if physical_main_button != 0:
+          self.main_sync_pending = False
+          self.main_sync_attempts = 0
+
+
+        if self.main_sync_pending:
+          if main_mode_sync == 0:
+            cloudlog.info(
+              f"[MAIN_SYNC] done frame={self.frame} "
+              f"attempts={self.main_sync_attempts}"
+            )
+            self.main_sync_pending = False
+            self.main_sync_attempts = 0
+
+
+          elif (
+            not CC.enabled and
+            physical_cruise_button == Buttons.NONE and
+            physical_main_button == 0 and
+            main_mode_sync == 1 and
+            self.main_sync_attempts < 2 and
+            self.frame - self.main_sync_last_send_frame >= 50
+          ):
+            # Use a private CLU11 copy so the live CarState snapshot is never
+            # mutated.  create_clu11_button() supplies the normal alive count.
+            main_sync_clu11 = dict(CS.clu11)
+            main_sync_clu11["CF_Clu_CruiseSwMain"] = 1
+
+
+            can_sends.append(
+              hyundaican.create_clu11_button(
+                self.packer,
+                self.frame,
+                main_sync_clu11,
+                Buttons.NONE,
+                self.CP.carFingerprint,
+              )
+            )
+
+
+            self.main_sync_last_send_frame = self.frame
+            self.main_sync_attempts += 1
+
+
+            cloudlog.info(
+              f"[MAIN_SYNC] pulse frame={self.frame} "
+              f"attempt={self.main_sync_attempts} S11M={main_mode_sync}"
+            )
+
+
+          elif (
+            self.main_sync_attempts >= 2 and
+            self.frame - self.main_sync_last_send_frame >= 100
+          ):
+            cloudlog.warning(
+              f"[MAIN_SYNC] failed frame={self.frame} S11M={main_mode_sync}"
+            )
+            self.main_sync_pending = False
+            self.main_sync_attempts = 0
+
+
 
 
       if not self.CP.openpilotLongitudinalControl:
@@ -422,7 +535,7 @@ class CarController:
 
 
 
-        # v1.8.4: 5 Hz transmit-boundary + Hyundai SCC/button trace.
+        # v1.8.5: 5 Hz transmit-boundary + Hyundai SCC/button/main-sync trace.
         #
         # AV/CE : CarState cruise available/enabled
         # MB/CB : physical MAIN / RES-SET-GAP-CANCEL button state
@@ -470,7 +583,9 @@ class CarController:
               f"CE={int(CS.out.cruiseState.enabled)} "
               f"MB={main_button} CB={cruise_button} "
               f"S11M={s11_main} S12A={s12_acc} "
-              f"GAS={int(CS.out.gasPressed)}"
+              f"GAS={int(CS.out.gasPressed)} "
+              f"MSP={int(self.main_sync_pending)} "
+              f"MSA={self.main_sync_attempts}"
             )
           except Exception:
             pass
