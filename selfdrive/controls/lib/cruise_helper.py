@@ -310,6 +310,15 @@ class CruiseHelper:
     global ButtonCnt, LongPressed, ButtonPrev
 
 
+    # v1.8.5.1: do not carry a partially tracked cruise-button press across
+    # a completed disengage/CANCEL into the next APilot session.
+    # ButtonPrev intentionally remains untouched; ButtonCnt == 0 makes the
+    # next real press establish a fresh ButtonPrev.
+    if not enabled:
+      ButtonCnt = 0
+      LongPressed = False
+
+
     button_speed_up_diff = 1
     button_speed_dn_diff = 10 if self.cruiseButtonMode in [3, 4] else 1
 
@@ -749,6 +758,39 @@ class CruiseHelper:
     longActiveUser = self.longActiveUser
 
 
+    # v1.8.5.1: first-press LongControl bootstrap using cereal.CarState
+    # buttonEvents only.  Do not access Hyundai-internal raw button deques here;
+    # the CS object received from controlsd is the
+    # Cap'n Proto CarState reader and does not expose those internal fields.
+    set_pressed = any(
+      b.pressed and b.type == ButtonType.decelCruise
+      for b in buttonEvents
+    )
+    res_pressed = any(
+      b.pressed and b.type == ButtonType.accelCruise
+      for b in buttonEvents
+    )
+
+    hyundai_openpilot_long = (
+      controls.CP.carName == "hyundai" and
+      controls.CP.openpilotLongitudinalControl
+    )
+
+    if enabled and hyundai_openpilot_long and self.longActiveUser <= 0:
+      if set_pressed:
+        longActiveUser = 1
+        v_cruise_kph = self.v_ego_kph_set
+        self.userCruisePaused = False
+      elif res_pressed:
+        longActiveUser = 1
+        v_cruise_kph = max(
+          v_cruise_kph,
+          self.v_cruise_kph_backup,
+          self.v_ego_kph_set,
+        )
+        self.userCruisePaused = False
+
+
     ##### Cruise Button 처리...
     if buttonLong:
       # v1.8.4:
@@ -995,103 +1037,3 @@ class CruiseHelper:
 
 
       self.cruise_control(controls, CS, longActiveUser, v_cruise_kph)
-
-
-
-
-      ###### 크루즈 속도제어~~~
-      self.v_cruise_kph_apply = self.cruise_control_speed(controls, CS, v_cruise_kph)
-
-
-      ###### leadCar 관련 속도처리
-      roadSpeed1 = self.roadSpeed * self.autoSpeedUptoRoadSpeedLimit
-      #if v_cruise_kph < roadSpeed1 and 50 > self.dRel > 0 and self.vRel > 0 and self.autoSpeedUptoRoadSpeedLimit > 0:
-      if v_cruise_kph < roadSpeed1 and self.autoSpeedUptoRoadSpeedLimit > 0:
-        if self.leadCarSpeed > v_cruise_kph:
-          v_cruise_kph = max(v_cruise_kph, min(self.leadCarSpeed, roadSpeed1))
-          self.v_cruise_kph_apply = v_cruise_kph
-      elif self.autoSpeedAdjustWithLeadCar > 0.0 and self.dRel > 0:
-        leadCarSpeed1 = max(self.leadCarSpeed + self.autoSpeedAdjustWithLeadCar, 30)
-        if leadCarSpeed1 < v_cruise_kph:
-          self.v_cruise_kph_apply = leadCarSpeed1
-      #controls.debugText1 = 'LC={:3.1f},{:3.1f},RS={:3.1f},SS={:3.1f}'.format( self.leadCarSpeed, vRel*CV.MS_TO_KPH, self.roadSpeed, self.v_cruise_kph_apply)      
-
-
-      ###### naviSpeed, roadSpeed, curveSpeed처리
-      applySpeedLimit = False
-      if self.autoNaviSpeedCtrl > 0 and self.naviSpeed > 0:
-        if self.naviSpeed < v_cruise_kph and self.longActiveUser:
-          #self.send_apilot_event(controls, EventName.speedDown, 60.0)  #시끄러..
-          if speedLimitType in [2]: # 과속카메라인경우에만 HDA깜박, 핸들진동
-            self.ndaActive = 2
-          pass
-          applySpeedLimit = True
-        self.v_cruise_kph_apply = min(self.v_cruise_kph_apply, self.naviSpeed)
-        #self.ndaActive = 2 if self.ndaActive == 1 else self.ndaActive
-      if self.roadSpeed > 30 and False: # 로드스피드리밋 사용안함..
-        if self.autoRoadLimitCtrl == 1:
-          self.v_cruise_kph_apply = min(self.v_cruise_kph_apply, self.roadSpeed)
-        elif self.autoRoadLimitCtrl == 2:
-          self.v_cruise_kph_apply = min(self.v_cruise_kph_apply, self.roadSpeed)
-      if self.autoCurveSpeedCtrlUse > 0:
-        if self.curveSpeed < v_cruise_kph and self.longActiveUser > 0:
-          #self.send_apilot_event(controls, EventName.speedDown, 60.0)
-          pass
-        if applySpeedLimit and 0 < leftSpeedDist < 100: #속도제한중이며, 남은거리가 100M가 안되면... 커브감속을 안하도록..
-          pass
-        else:
-          self.v_cruise_kph_apply = min(self.v_cruise_kph_apply, self.curveSpeed)
-
-
-    self.preBrakePressed = brakePressed
-    self.xState_prev = self.xState
-    if self.v_ego_kph < 20.0:
-      self.slowSpeedFrameCount += 1
-    else:
-      self.slowSpeedFrameCount = 0
-
-
-    if CS.gasPressed:
-      self.gasPressedFrame = self.frame
-      self.gasPressedCount += 1
-      if CS.gas > self.preGasPressedMax:
-        self.preGasPressedMax = CS.gas
-      #controls.debugText1 = 'GAS: {:3.1f}/{:3.1f}={:3.1f}'.format(CS.gas*100., self.preGasPressedMax*100., self.gasPressedCount * DT_CTRL)
-    else:
-      self.preGasPressedMax = 0.0
-      self.gasPressedCount = 0
-    return v_cruise_kph
-
-
-def enable_radar_tracks(CP, logcan, sendcan):
-  # START: Try to enable radar tracks
-  print("Try to enable radar tracks")  
-  # if self.CP.openpilotLongitudinalControl and self.CP.carFingerprint in [HYUNDAI_CAR.SANTA_FE_2022]:
-  if CP.openpilotLongitudinalControl: # and CP.carFingerprint in [CAR.SANTA_FE, CAR.SANTA_FE_HEV_2022, CAR.NEXO]:
-    rdr_fw = None
-    rdr_fw_address = 0x7d0 #일부차량은 다름..
-    if True:
-      for i in range(10):
-        print("O yes")
-      try:
-        for i in range(40):
-          try:
-            query = IsoTpParallelQuery(sendcan, logcan, CP.sccBus, [rdr_fw_address], [b'\x10\x07'], [b'\x50\x07'], debug=True)
-            for addr, dat in query.get_data(0.1).items(): # pylint: disable=unused-variable
-              print("ecu write data by id ...")
-              new_config = b"\x00\x00\x00\x01\x00\x01"
-              #new_config = b"\x00\x00\x00\x00\x00\x01"
-              dataId = b'\x01\x42'
-              WRITE_DAT_REQUEST = b'\x2e'
-              WRITE_DAT_RESPONSE = b'\x68'
-              query = IsoTpParallelQuery(sendcan, logcan, CP.sccBus, [rdr_fw_address], [WRITE_DAT_REQUEST+dataId+new_config], [WRITE_DAT_RESPONSE], debug=True)
-              query.get_data(0)
-              print(f"Try {i+1}")
-              break
-            break
-          except Exception as e:
-            print(f"Failed {i}: {e}") 
-      except Exception as e:
-        print("Failed to enable tracks" + str(e))
-  print("END Try to enable radar tracks")
-  # END try to enable radar tracks
