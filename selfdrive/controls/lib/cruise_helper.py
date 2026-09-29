@@ -1038,6 +1038,73 @@ class CruiseHelper:
 
       self.cruise_control(controls, CS, longActiveUser, v_cruise_kph)
 
+
+
+
+      ###### 크루즈 속도제어~~~
+      self.v_cruise_kph_apply = self.cruise_control_speed(controls, CS, v_cruise_kph)
+
+
+      ###### leadCar 관련 속도처리
+      roadSpeed1 = self.roadSpeed * self.autoSpeedUptoRoadSpeedLimit
+      #if v_cruise_kph < roadSpeed1 and 50 > self.dRel > 0 and self.vRel > 0 and self.autoSpeedUptoRoadSpeedLimit > 0:
+      if v_cruise_kph < roadSpeed1 and self.autoSpeedUptoRoadSpeedLimit > 0:
+        if self.leadCarSpeed > v_cruise_kph:
+          v_cruise_kph = max(v_cruise_kph, min(self.leadCarSpeed, roadSpeed1))
+          self.v_cruise_kph_apply = v_cruise_kph
+      elif self.autoSpeedAdjustWithLeadCar > 0.0 and self.dRel > 0:
+        leadCarSpeed1 = max(self.leadCarSpeed + self.autoSpeedAdjustWithLeadCar, 30)
+        if leadCarSpeed1 < v_cruise_kph:
+          self.v_cruise_kph_apply = leadCarSpeed1
+      #controls.debugText1 = 'LC={:3.1f},{:3.1f},RS={:3.1f},SS={:3.1f}'.format( self.leadCarSpeed, vRel*CV.MS_TO_KPH, self.roadSpeed, self.v_cruise_kph_apply)      
+
+
+      ###### naviSpeed, roadSpeed, curveSpeed처리
+      applySpeedLimit = False
+      if self.autoNaviSpeedCtrl > 0 and self.naviSpeed > 0:
+        if self.naviSpeed < v_cruise_kph and self.longActiveUser:
+          #self.send_apilot_event(controls, EventName.speedDown, 60.0)  #시끄러..
+          if speedLimitType in [2]: # 과속카메라인경우에만 HDA깜박, 핸들진동
+            self.ndaActive = 2
+          pass
+          applySpeedLimit = True
+        self.v_cruise_kph_apply = min(self.v_cruise_kph_apply, self.naviSpeed)
+        #self.ndaActive = 2 if self.ndaActive == 1 else self.ndaActive
+      if self.roadSpeed > 30 and False: # 로드스피드리밋 사용안함..
+        if self.autoRoadLimitCtrl == 1:
+          self.v_cruise_kph_apply = min(self.v_cruise_kph_apply, self.roadSpeed)
+        elif self.autoRoadLimitCtrl == 2:
+          self.v_cruise_kph_apply = min(self.v_cruise_kph_apply, self.roadSpeed)
+      if self.autoCurveSpeedCtrlUse > 0:
+        if self.curveSpeed < v_cruise_kph and self.longActiveUser > 0:
+          #self.send_apilot_event(controls, EventName.speedDown, 60.0)
+          pass
+        if applySpeedLimit and 0 < leftSpeedDist < 100: #속도제한중이며, 남은거리가 100M가 안되면... 커브감속을 안하도록..
+          pass
+        else:
+          self.v_cruise_kph_apply = min(self.v_cruise_kph_apply, self.curveSpeed)
+
+
+    self.preBrakePressed = brakePressed
+    self.xState_prev = self.xState
+    if self.v_ego_kph < 20.0:
+      self.slowSpeedFrameCount += 1
+    else:
+      self.slowSpeedFrameCount = 0
+
+
+    if CS.gasPressed:
+      self.gasPressedFrame = self.frame
+      self.gasPressedCount += 1
+      if CS.gas > self.preGasPressedMax:
+        self.preGasPressedMax = CS.gas
+      #controls.debugText1 = 'GAS: {:3.1f}/{:3.1f}={:3.1f}'.format(CS.gas*100., self.preGasPressedMax*100., self.gasPressedCount * DT_CTRL)
+    else:
+      self.preGasPressedMax = 0.0
+      self.gasPressedCount = 0
+    return v_cruise_kph
+
+
 def enable_radar_tracks(CP, logcan, sendcan):
   # START: Try to enable radar tracks
   print("Try to enable radar tracks")  
