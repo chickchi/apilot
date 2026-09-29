@@ -392,7 +392,13 @@ class CarController:
             main_sync_clu11 = dict(CS.clu11)
             main_sync_clu11["CF_Clu_CruiseSwMain"] = 1
 
-            can_sends.append(
+            # IMPORTANT for SCC bus 2:
+            # create_clu11_button() normally selects bus 0 for classic non-
+            # camera-SCC cars. A host-transmitted bus-0 CLU11 does NOT pass
+            # through Panda's RX forwarding hook, so the SCC ECU on bus 2
+            # would never see that synthetic MAIN press. Send this one
+            # synchronization frame directly to bus 2.
+            main_sync_msg = list(
               hyundaican.create_clu11_button(
                 self.packer,
                 self.frame,
@@ -401,13 +407,16 @@ class CarController:
                 self.CP.carFingerprint,
               )
             )
+            main_sync_msg[-1] = 2
+            can_sends.append(main_sync_msg)
 
             self.main_sync_last_send_frame = self.frame
             self.main_sync_attempts += 1
 
             cloudlog.info(
               f"[MAIN_SYNC] pulse frame={self.frame} "
-              f"attempt={self.main_sync_attempts} S11M={main_mode_sync}"
+              f"attempt={self.main_sync_attempts} S11M={main_mode_sync} "
+              f"TXBUS=2"
             )
 
           elif (
