@@ -103,6 +103,17 @@ AddrCheckStruct hyundai_legacy_addr_checks[] = {
 
 bool hyundai_legacy = false;
 
+// v1.8.6: in the legacy safety model, remember whether OP-long was requested
+// before legacy_init deliberately forces hyundai_longitudinal false.  This is
+// used only to scope the bounded CLU11 proxy window to the SCC-bus2 OP-long
+// configuration that requests FLAG_HYUNDAI_LONG.
+bool hyundai_legacy_long_requested = false;
+bool hyundai_clu11_proxy_block = false;
+uint32_t hyundai_clu11_proxy_start_ts = 0U;
+int hyundai_clu11_prev_cruise_button = 0;
+
+const uint32_t HYUNDAI_CLU11_PROXY_BLOCK_US = 450000U;
+
 addr_checks hyundai_rx_checks = {hyundai_addr_checks, HYUNDAI_ADDR_CHECK_LEN};
 
 static uint8_t hyundai_get_counter(CANPacket_t *to_push) {
@@ -375,6 +386,43 @@ static int hyundai_fwd_hook(int bus_num, CANPacket_t *to_fwd) {
         bus_fwd = -1;
       }
     }
+
+    // v1.8.6 HKG-style MAIN synchronization for legacy + OP-long.
+    // Forward the physical CANCEL itself.  When CANCEL is released, suppress
+    // only the idle CLU11 stream for 450 ms while carcontroller proxies those
+    // exact counters to bus2 with a controlled MAIN press/release sequence.
+    // Any new physical cruise/MAIN input immediately ends the suppression and
+    // is forwarded normally, so driver input always has priority.
+    if (hyundai_legacy_long_requested && hyundai_scc_bus2 && (addr == 1265)) {
+      int cruise_button = GET_BYTE(to_fwd, 0) & 0x7U;
+      int main_button = GET_BIT(to_fwd, 3U);
+
+      bool cancel_released =
+        (hyundai_clu11_prev_cruise_button == HYUNDAI_BTN_CANCEL) &&
+        (cruise_button == 0) &&
+        (main_button == 0);
+
+      if (cancel_released) {
+        hyundai_clu11_proxy_block = true;
+        hyundai_clu11_proxy_start_ts = now;
+      }
+
+      bool new_driver_input = (cruise_button != 0) || (main_button != 0);
+      if (new_driver_input) {
+        hyundai_clu11_proxy_block = false;
+      }
+
+      if (hyundai_clu11_proxy_block) {
+        uint32_t proxy_elapsed = get_ts_elapsed(now, hyundai_clu11_proxy_start_ts);
+        if (proxy_elapsed < HYUNDAI_CLU11_PROXY_BLOCK_US) {
+          bus_fwd = -1;
+        } else {
+          hyundai_clu11_proxy_block = false;
+        }
+      }
+
+      hyundai_clu11_prev_cruise_button = cruise_button;
+    }
   }
 
   if (bus_num == 2) {
@@ -410,6 +458,10 @@ static int hyundai_fwd_hook(int bus_num, CANPacket_t *to_fwd) {
 static const addr_checks* hyundai_init(int16_t param) {
   hyundai_common_init(param);
   hyundai_legacy = false;
+  hyundai_legacy_long_requested = false;
+  hyundai_clu11_proxy_block = false;
+  hyundai_clu11_proxy_start_ts = 0U;
+  hyundai_clu11_prev_cruise_button = 0;
 
   if (hyundai_camera_scc) {
     hyundai_longitudinal = false;
@@ -428,7 +480,13 @@ static const addr_checks* hyundai_init(int16_t param) {
 static const addr_checks* hyundai_legacy_init(int16_t param) {
   hyundai_common_init(param);
   hyundai_legacy = true;
+  // Capture the requested OP-long flag before legacy mode intentionally
+  // switches the standard longitudinal safety state back off.
+  hyundai_legacy_long_requested = hyundai_longitudinal;
   hyundai_longitudinal = false;
+  hyundai_clu11_proxy_block = false;
+  hyundai_clu11_proxy_start_ts = 0U;
+  hyundai_clu11_prev_cruise_button = 0;
   hyundai_camera_scc = false;
 
   hyundai_rx_checks = (addr_checks){hyundai_legacy_addr_checks, HYUNDAI_LEGACY_ADDR_CHECK_LEN};
