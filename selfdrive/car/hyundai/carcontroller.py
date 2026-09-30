@@ -119,6 +119,19 @@ class CarController:
     self.main_sync_attempts = 0
     self.main_sync_last_send_frame = -1000
 
+    # v1.8.5.5: MAIN_SYNC is a short, timed MAIN hold rather than a
+    # single-frame pulse.  Classic CLU11 runs at about 50 Hz, while the
+    # controller loop is 100 Hz, so transmit one synthetic MAIN frame
+    # every ~20 ms for ~300 ms, then allow ~200 ms for SCC11 feedback.
+    #
+    # Two bounded attempts are allowed.  Physical driver input always wins.
+    self.main_sync_phase = 0  # 0=ready, 1=MAIN hold, 2=settle
+    self.main_sync_phase_start_frame = -1000
+    self.main_sync_tx_count = 0
+    self.main_sync_hold_frames = max(1, int(round(0.30 / DT_CTRL)))
+    self.main_sync_settle_frames = max(1, int(round(0.20 / DT_CTRL)))
+    self.main_sync_tx_interval_frames = max(1, int(round(0.02 / DT_CTRL)))
+
 
 
 
@@ -331,16 +344,22 @@ class CarController:
 
 
 
-      # v1.8.5.1: after a physical CANCEL, synchronize OEM SCC MAIN back
-      # to OFF on classic CAN + openpilot longitudinal + SCC bus 2.  This
-      # block is inside the classic-CAN branch, so CAN-FD vehicles never run it.
+      # v1.8.5.5: after a physical CANCEL, synchronize OEM SCC MAIN back
+      # to OFF on classic CAN + openpilot longitudinal + SCC bus 2.
+      #
+      # Why a timed hold instead of the v1.8.5.4 single-frame pulse:
+      # real-car logs showed TXBUS=2 was attempted twice, but SCC11
+      # MainMode_ACC stayed at 1.  A physical MAIN press is held across
+      # multiple CLU11 frames, so reproduce a short 50 Hz MAIN hold.
       #
       # Safety gates:
+      # - classic CAN branch only
+      # - SCC bus 2 + openpilot longitudinal only
       # - never transmit while APilot is enabled
-      # - never transmit while a physical MAIN/SET/RES/GAP/CANCEL is pressed
-      # - transmit only with received SCC11.MainMode_ACC == 1
-      # - at most two synthetic MAIN pulses
-      # - any real MAIN press cancels pending synchronization immediately
+      # - never transmit while any physical cruise/MAIN button is held
+      # - transmit only while received SCC11.MainMode_ACC == 1
+      # - at most two bounded hold attempts
+      # - any real MAIN/SET/RES/GAP input cancels pending synchronization
       if self.CP.openpilotLongitudinalControl and self.CP.sccBus == 2:
         scc11_main_sync = getattr(CS, "scc11", None)
         main_mode_sync = (
@@ -360,74 +379,164 @@ class CarController:
           else 0
         )
 
-        # CANCEL requests full APilot OFF.  If OEM MAIN remains latched ON,
-        # remember to toggle it OFF after the physical CANCEL is released.
-        if physical_cruise_button == Buttons.CANCEL and main_mode_sync == 1:
+        # Arm once on CANCEL while OEM MAIN is still ON.  Do not repeatedly
+        # reset the state while the driver continues to hold CANCEL.
+        if (
+          physical_cruise_button == Buttons.CANCEL and
+          main_mode_sync == 1 and
+          not self.main_sync_pending
+        ):
           self.main_sync_pending = True
           self.main_sync_attempts = 0
+          self.main_sync_phase = 0
+          self.main_sync_phase_start_frame = self.frame
+          self.main_sync_last_send_frame = (
+            self.frame - self.main_sync_tx_interval_frames
+          )
+          self.main_sync_tx_count = 0
+          cloudlog.info(
+            f"[MAIN_SYNC] armed frame={self.frame} S11M={main_mode_sync}"
+          )
 
-        # Real driver MAIN always wins over synthetic synchronization.
-        if physical_main_button != 0:
+        # Any new real driver request wins over synthetic synchronization.
+        # CANCEL itself is excluded here because it is what arms the sync.
+        if self.main_sync_pending and (
+          physical_main_button != 0 or
+          physical_cruise_button not in (Buttons.NONE, Buttons.CANCEL)
+        ):
+          cloudlog.info(
+            f"[MAIN_SYNC] abort_input frame={self.frame} "
+            f"MB={physical_main_button} CB={physical_cruise_button}"
+          )
           self.main_sync_pending = False
           self.main_sync_attempts = 0
+          self.main_sync_phase = 0
+          self.main_sync_tx_count = 0
 
         if self.main_sync_pending:
+          # SCC11 feedback is authoritative.  Stop immediately once MAIN
+          # actually becomes OFF; the normal physical CLU11 stream supplies
+          # the release (MAIN=0) frames after the synthetic hold stops.
           if main_mode_sync == 0:
             cloudlog.info(
               f"[MAIN_SYNC] done frame={self.frame} "
-              f"attempts={self.main_sync_attempts}"
+              f"attempts={self.main_sync_attempts} "
+              f"tx={self.main_sync_tx_count}"
             )
             self.main_sync_pending = False
             self.main_sync_attempts = 0
+            self.main_sync_phase = 0
+            self.main_sync_tx_count = 0
+
+          # If controls somehow re-engaged after CANCEL release, never leave
+          # a delayed synthetic MAIN waiting to fire later.
+          elif (
+            CC.enabled and
+            physical_cruise_button == Buttons.NONE and
+            physical_main_button == 0
+          ):
+            cloudlog.info(
+              f"[MAIN_SYNC] abort_enabled frame={self.frame} "
+              f"S11M={main_mode_sync}"
+            )
+            self.main_sync_pending = False
+            self.main_sync_attempts = 0
+            self.main_sync_phase = 0
+            self.main_sync_tx_count = 0
 
           elif (
             not CC.enabled and
             physical_cruise_button == Buttons.NONE and
             physical_main_button == 0 and
-            main_mode_sync == 1 and
-            self.main_sync_attempts < 2 and
-            self.frame - self.main_sync_last_send_frame >= 50
+            main_mode_sync == 1
           ):
-            # Work on a private CLU11 copy; never mutate the live CarState.
-            main_sync_clu11 = dict(CS.clu11)
-            main_sync_clu11["CF_Clu_CruiseSwMain"] = 1
+            # Phase 0: start one bounded MAIN-hold attempt.
+            if self.main_sync_phase == 0:
+              if self.main_sync_attempts < 2:
+                self.main_sync_attempts += 1
+                self.main_sync_phase = 1
+                self.main_sync_phase_start_frame = self.frame
+                self.main_sync_last_send_frame = (
+                  self.frame - self.main_sync_tx_interval_frames
+                )
+                self.main_sync_tx_count = 0
+                cloudlog.info(
+                  f"[MAIN_SYNC] hold_start frame={self.frame} "
+                  f"attempt={self.main_sync_attempts} "
+                  f"S11M={main_mode_sync} TXBUS=2 "
+                  f"hold_frames={self.main_sync_hold_frames}"
+                )
 
-            # IMPORTANT for SCC bus 2:
-            # create_clu11_button() normally selects bus 0 for classic non-
-            # camera-SCC cars. A host-transmitted bus-0 CLU11 does NOT pass
-            # through Panda's RX forwarding hook, so the SCC ECU on bus 2
-            # would never see that synthetic MAIN press. Send this one
-            # synchronization frame directly to bus 2.
-            main_sync_msg = list(
-              hyundaican.create_clu11_button(
-                self.packer,
-                self.frame,
-                main_sync_clu11,
-                Buttons.NONE,
-                self.CP.carFingerprint,
-              )
-            )
-            main_sync_msg[-1] = 2
-            can_sends.append(main_sync_msg)
+            # Phase 1: hold MAIN=1 at roughly the physical CLU11 rate.
+            if self.main_sync_phase == 1:
+              hold_age = self.frame - self.main_sync_phase_start_frame
 
-            self.main_sync_last_send_frame = self.frame
-            self.main_sync_attempts += 1
+              if hold_age < self.main_sync_hold_frames:
+                if (
+                  self.frame - self.main_sync_last_send_frame >=
+                  self.main_sync_tx_interval_frames
+                ):
+                  # Work on a private CLU11 copy; never mutate live CarState.
+                  # create_clu11_button() advances the received alive counter
+                  # by one, which keeps each synthetic frame aligned with the
+                  # next expected CLU11 counter value.
+                  main_sync_clu11 = dict(CS.clu11)
+                  main_sync_clu11["CF_Clu_CruiseSwMain"] = 1
 
-            cloudlog.info(
-              f"[MAIN_SYNC] pulse frame={self.frame} "
-              f"attempt={self.main_sync_attempts} S11M={main_mode_sync} "
-              f"TXBUS=2"
-            )
+                  main_sync_msg = list(
+                    hyundaican.create_clu11_button(
+                      self.packer,
+                      self.frame,
+                      main_sync_clu11,
+                      Buttons.NONE,
+                      self.CP.carFingerprint,
+                    )
+                  )
 
-          elif (
-            self.main_sync_attempts >= 2 and
-            self.frame - self.main_sync_last_send_frame >= 100
-          ):
-            cloudlog.warning(
-              f"[MAIN_SYNC] failed frame={self.frame} S11M={main_mode_sync}"
-            )
-            self.main_sync_pending = False
-            self.main_sync_attempts = 0
+                  # v1.8.5.4 finding retained: a host TX on bus 0 does not
+                  # traverse Panda's RX forwarding path.  Deliver the
+                  # synthetic MAIN directly to the SCC side on bus 2.
+                  main_sync_msg[-1] = 2
+                  can_sends.append(main_sync_msg)
+
+                  self.main_sync_last_send_frame = self.frame
+                  self.main_sync_tx_count += 1
+
+              else:
+                self.main_sync_phase = 2
+                self.main_sync_phase_start_frame = self.frame
+                cloudlog.info(
+                  f"[MAIN_SYNC] hold_end frame={self.frame} "
+                  f"attempt={self.main_sync_attempts} "
+                  f"tx={self.main_sync_tx_count} S11M={main_mode_sync}"
+                )
+
+            # Phase 2: stop synthetic MAIN and allow normal MAIN=0 CLU11
+            # frames plus SCC11 feedback time before deciding on a retry.
+            elif self.main_sync_phase == 2:
+              settle_age = self.frame - self.main_sync_phase_start_frame
+
+              if settle_age >= self.main_sync_settle_frames:
+                if self.main_sync_attempts < 2:
+                  cloudlog.info(
+                    f"[MAIN_SYNC] retry frame={self.frame} "
+                    f"attempt={self.main_sync_attempts + 1} "
+                    f"S11M={main_mode_sync}"
+                  )
+                  self.main_sync_phase = 0
+                  self.main_sync_phase_start_frame = self.frame
+                  self.main_sync_tx_count = 0
+
+                else:
+                  cloudlog.warning(
+                    f"[MAIN_SYNC] failed frame={self.frame} "
+                    f"attempts={self.main_sync_attempts} "
+                    f"S11M={main_mode_sync}"
+                  )
+                  self.main_sync_pending = False
+                  self.main_sync_attempts = 0
+                  self.main_sync_phase = 0
+                  self.main_sync_tx_count = 0
 
 
       if not self.CP.openpilotLongitudinalControl:
@@ -579,7 +688,9 @@ class CarController:
               f"S11M={s11_main} S12A={s12_acc} "
               f"GAS={int(CS.out.gasPressed)} "
               f"MSP={int(self.main_sync_pending)} "
-              f"MSA={self.main_sync_attempts}"
+              f"MSA={self.main_sync_attempts} "
+              f"MSPH={self.main_sync_phase} "
+              f"MSTX={self.main_sync_tx_count}"
             )
           except Exception:
             pass
