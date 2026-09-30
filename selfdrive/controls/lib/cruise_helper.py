@@ -775,8 +775,22 @@ class CruiseHelper:
       controls.CP.carName == "hyundai" and
       controls.CP.openpilotLongitudinalControl
     )
+    legacy_hkg_buttons = (
+      hyundai_openpilot_long and
+      getattr(controls.CP, "sccBus", -1) == 2
+    )
 
-    if enabled and hyundai_openpilot_long and self.longActiveUser <= 0:
+    # v1.8.7-HKG:
+    # MAIN owns APilot/Lateral engagement. SET/RES own LongControl/speed.
+    # In this HKG mode process SET/RES once, on the semantic release action.
+    # The old raw press-edge bootstrap plus release processing could turn
+    # LongControl on and then immediately hit the SET pause path.
+    if (
+      enabled and
+      hyundai_openpilot_long and
+      not legacy_hkg_buttons and
+      self.longActiveUser <= 0
+    ):
       if set_pressed:
         longActiveUser = 1
         v_cruise_kph = self.v_ego_kph_set
@@ -838,28 +852,41 @@ class CruiseHelper:
       elif button == ButtonType.decelCruise:
         controls.cruiseButtonCounter -= 1
         if self.longActiveUser <= 0:
-          v_cruise_kph = self.v_ego_kph_set  ## 현재속도도 크루즈세트
+          # First SET after MAIN: enable LongControl and set current speed.
+          v_cruise_kph = self.v_ego_kph_set
           longActiveUser = 1
+          self.userCruisePaused = False
         else:
-          if self.xState == XState.softHold:
-            longActiveUser = 1
-          if CS.gasPressed and v_cruise_kph < self.v_ego_kph_set:
-            v_cruise_kph = self.v_ego_kph_set
-          elif self.xState == XState.softHold:
-            pass
-          elif self.xState == XState.e2eStop and self.v_ego_kph < 5: #5km/h 미만, 신호감속중.. (-)를 누르면 크루즈해제... 이러면 설설가겠지? 다시누르면 정지..
-            v_cruise_kph = 3
-            longActiveUser = -1
-            pass
-          elif v_cruise_kph > self.v_ego_kph_set+2 and self.cruiseButtonMode in [1,2]:
-            v_cruise_kph = self.v_ego_kph_set
-          else:
-            if self.cruiseButtonMode==2:
-              self.userCruisePaused = True
-              longActiveUser = -1
-              controls.events.add(EventName.audioPrompt)
+          # v1.8.7-HKG: SET is always a speed-control button once LongControl
+          # is active. It must not double as a LongControl pause/off command.
+          if legacy_hkg_buttons:
+            if self.xState == XState.softHold:
+              longActiveUser = 1
+            elif CS.gasPressed and v_cruise_kph < self.v_ego_kph_set:
+              v_cruise_kph = self.v_ego_kph_set
             else:
               v_cruise_kph = buttonSpeed
+            self.userCruisePaused = False
+          else:
+            if self.xState == XState.softHold:
+              longActiveUser = 1
+            if CS.gasPressed and v_cruise_kph < self.v_ego_kph_set:
+              v_cruise_kph = self.v_ego_kph_set
+            elif self.xState == XState.softHold:
+              pass
+            elif self.xState == XState.e2eStop and self.v_ego_kph < 5: #5km/h 미만, 신호감속중.. (-)를 누르면 크루즈해제... 이러면 설설가겠지? 다시누르면 정지..
+              v_cruise_kph = 3
+              longActiveUser = -1
+              pass
+            elif v_cruise_kph > self.v_ego_kph_set+2 and self.cruiseButtonMode in [1,2]:
+              v_cruise_kph = self.v_ego_kph_set
+            else:
+              if self.cruiseButtonMode==2:
+                self.userCruisePaused = True
+                longActiveUser = -1
+                controls.events.add(EventName.audioPrompt)
+              else:
+                v_cruise_kph = buttonSpeed
 
 
     return longActiveUser, v_cruise_kph
