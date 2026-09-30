@@ -1,30 +1,25 @@
 #include "safety_hyundai_common.h"
 
-#define HYUNDAI_LIMITS(steer, rate_up, rate_down) { \
-  .max_steer = (steer), \
-  .max_rate_up = (rate_up), \
-  .max_rate_down = (rate_down), \
-  .max_rt_delta = 300, /*120 */ \
-  .max_rt_interval = 250000, \
-  .driver_torque_allowance = 350, \
-  .driver_torque_factor = 2, \
-  .type = TorqueDriverLimited, \
-   /* the EPS faults when the steering angle is above a certain threshold for too long. to prevent this, */ \
-   /* we allow setting CF_Lkas_ActToi bit to 0 while maintaining the requested torque value for two consecutive frames */ \
-  .min_valid_request_frames = 89, \
-  .max_invalid_request_frames = 2, \
-  .min_valid_request_rt_interval = 810000,  /* 810ms; a ~10% buffer on cutting every 90 frames */ \
-  .has_steer_req_tolerance = true, \
-}
+const SteeringLimits HYUNDAI_STEERING_LIMITS = {
+  .max_steer = 509,
+  .max_rt_delta = 300, //112,
+  .max_rt_interval = 250000,
+  .max_rate_up = 30,
+  .max_rate_down = 30,
+  .driver_torque_allowance = 350,
+  .driver_torque_factor = 2,
+  .type = TorqueDriverLimited,
 
-//const SteeringLimits HYUNDAI_STEERING_LIMITS = HYUNDAI_LIMITS(409, 3, 7);
-const SteeringLimits HYUNDAI_STEERING_LIMITS = HYUNDAI_LIMITS(509, 30, 30);
-const SteeringLimits HYUNDAI_STEERING_LIMITS_ALT = HYUNDAI_LIMITS(409, 11, 11);
-
-const LongitudinalLimits HYUNDAI_LONG_LIMITS = {
-  .max_accel = 250,   // 1/100 m/s2
-  .min_accel = -400,  // 1/100 m/s2
+  // the EPS faults when the steering angle is above a certain threshold for too long. to prevent this,
+  // we allow setting CF_Lkas_ActToi bit to 0 while maintaining the requested torque value for two consecutive frames
+  .min_valid_request_frames = 89,
+  .max_invalid_request_frames = 2,
+  .min_valid_request_rt_interval = 810000,  // 810ms; a ~10% buffer on cutting every 90 frames
+  .has_steer_req_tolerance = true,
 };
+
+const int HYUNDAI_MAX_ACCEL = 250;  // 1/100 m/s2
+const int HYUNDAI_MIN_ACCEL = -400; // -350; // 1/100 m/s2
 
 const CanMsg HYUNDAI_TX_MSGS[] = {
   {593, 2, 8},                              // MDPS12, Bus 2
@@ -108,12 +103,22 @@ AddrCheckStruct hyundai_legacy_addr_checks[] = {
 
 bool hyundai_legacy = false;
 
+// v1.8.7-HKG:
+// Legacy safety intentionally clears hyundai_longitudinal after init, so keep
+// the originally requested OP-long flag only to scope this SCC-bus2 behavior.
+bool hyundai_legacy_long_requested = false;
+
+// Received OEM SCC MAIN state and one-shot re-engage forwarding guard.
+bool hyundai_scc_main_on = false;
+bool hyundai_main_reengage_guard = false;
+bool hyundai_main_reengage_main_seen = false;
+
 addr_checks hyundai_rx_checks = {hyundai_addr_checks, HYUNDAI_ADDR_CHECK_LEN};
 
 static uint8_t hyundai_get_counter(CANPacket_t *to_push) {
   int addr = GET_ADDR(to_push);
 
-  uint8_t cnt = 0;
+  uint8_t cnt;
   if (addr == 608) {
     cnt = (GET_BYTE(to_push, 7) >> 4) & 0x3U;
   } else if (addr == 902) {
@@ -125,14 +130,15 @@ static uint8_t hyundai_get_counter(CANPacket_t *to_push) {
   } else if (addr == 1265) {
     cnt = (GET_BYTE(to_push, 3) >> 4) & 0xFU;
   } else {
+    cnt = 0;
   }
   return cnt;
 }
 
-static uint32_t hyundai_get_checksum(CANPacket_t *to_push) {
+static uint8_t hyundai_get_checksum(CANPacket_t *to_push) {
   int addr = GET_ADDR(to_push);
 
-  uint8_t chksum = 0;
+  uint8_t chksum;
   if (addr == 608) {
     chksum = GET_BYTE(to_push, 7) & 0xFU;
   } else if (addr == 902) {
@@ -142,11 +148,12 @@ static uint32_t hyundai_get_checksum(CANPacket_t *to_push) {
   } else if (addr == 1057) {
     chksum = GET_BYTE(to_push, 7) >> 4;
   } else {
+    chksum = 0;
   }
   return chksum;
 }
 
-static uint32_t hyundai_compute_checksum(CANPacket_t *to_push) {
+static uint8_t hyundai_compute_checksum(CANPacket_t *to_push) {
   int addr = GET_ADDR(to_push);
 
   uint8_t chksum = 0;
@@ -186,7 +193,7 @@ static int hyundai_rx_hook(CANPacket_t *to_push) {
 
   bool valid = addr_safety_check(to_push, &hyundai_rx_checks,
                                  hyundai_get_checksum, hyundai_compute_checksum,
-                                 hyundai_get_counter, NULL);
+                                 hyundai_get_counter);
 
   int bus = GET_BUS(to_push);
   int addr = GET_ADDR(to_push);
@@ -198,9 +205,10 @@ static int hyundai_rx_hook(CANPacket_t *to_push) {
     hyundai_common_cruise_state_check(cruise_engaged);
   }*/
 
-  if (valid && (addr == 1056)) { //  MainMode_ACC
-    // 1 bits: 0
+  if (valid && (addr == 1056)) { // MainMode_ACC
+    // 1 bit: 0
     int cruise_available = GET_BIT(to_push, 0U);
+    hyundai_scc_main_on = cruise_available != 0;
     hyundai_common_cruise_state_check(cruise_available);
   }
 
@@ -259,7 +267,7 @@ uint32_t last_ts_scc12_from_op = 0;
 uint32_t last_ts_mdps12_from_op = 0;
 uint32_t last_ts_fca11_from_op = 0;
 
-static int hyundai_tx_hook(CANPacket_t *to_send) {
+static int hyundai_tx_hook(CANPacket_t *to_send, bool longitudinal_allowed) {
 
   int tx = 1;
   int addr = GET_ADDR(to_send);
@@ -289,7 +297,7 @@ static int hyundai_tx_hook(CANPacket_t *to_send) {
 
     if ((CR_VSM_DecCmd != 0) || (FCA_CmdAct != 0) || (CF_VSM_DecCmdAct != 0)) {
       tx = 0;
-      print("violation[FCA11, 909]\n");
+      puts("violation[FCA11, 909]\n");
     }
   }
 
@@ -301,15 +309,20 @@ static int hyundai_tx_hook(CANPacket_t *to_send) {
     //int aeb_decel_cmd = GET_BYTE(to_send, 2);
     //int aeb_req = GET_BIT(to_send, 54U);
 
-    bool violation = false;
+    bool violation = 0;
 
-    violation |= longitudinal_accel_checks(desired_accel_raw, HYUNDAI_LONG_LIMITS);
-    violation |= longitudinal_accel_checks(desired_accel_val, HYUNDAI_LONG_LIMITS);
+    if (!longitudinal_allowed) {
+      if ((desired_accel_raw != 0) || (desired_accel_val != 0)) {
+          violation = 1;
+      }
+    }
+    violation |= max_limit_check(desired_accel_raw, HYUNDAI_MAX_ACCEL, HYUNDAI_MIN_ACCEL);  
+    violation |= max_limit_check(desired_accel_val, HYUNDAI_MAX_ACCEL, HYUNDAI_MIN_ACCEL);
+
     //violation |= (aeb_decel_cmd != 0);
     //violation |= (aeb_req != 0);
 
     if (violation) {
-        print("violation[1057]\n");
       tx = 0;
     }
   }
@@ -319,10 +332,9 @@ static int hyundai_tx_hook(CANPacket_t *to_send) {
     int desired_torque = ((GET_BYTES(to_send, 0, 4) >> 16) & 0x7ffU) - 1024U;
     bool steer_req = GET_BIT(to_send, 27U) != 0U;
 
-    const SteeringLimits limits = hyundai_alt_limits ? HYUNDAI_STEERING_LIMITS_ALT : HYUNDAI_STEERING_LIMITS;
-    if (steer_torque_cmd_checks(desired_torque, steer_req, limits)) {
+    if (steer_torque_cmd_checks(desired_torque, steer_req, HYUNDAI_STEERING_LIMITS)) {
       //tx = 0;
-      print("violation[LKAS11, 832]\n");
+      puts("violation[LKAS11, 832]\n");
     }
   }
 
@@ -358,9 +370,10 @@ static int hyundai_tx_hook(CANPacket_t *to_send) {
   return tx;
 }
 
-static int hyundai_fwd_hook(int bus_num, int addr) {
+static int hyundai_fwd_hook(int bus_num, CANPacket_t *to_fwd) {
 
   int bus_fwd = -1;
+  int addr = GET_ADDR(to_fwd);
 
   uint32_t now = microsecond_timer_get();
 
@@ -371,6 +384,53 @@ static int hyundai_fwd_hook(int bus_num, int addr) {
     if(addr == 593) {
       if(now - last_ts_mdps12_from_op < 200000) {
         bus_fwd = -1;
+      }
+    }
+
+    // v1.8.7-HKG MAIN phase guard for legacy + OP-long + SCC bus2.
+    //
+    // CANCEL is forwarded normally. If OEM MainMode_ACC is still ON when
+    // CANCEL is pressed, preserve that phase until the next explicit MAIN:
+    //   - SET/RES/GAP are not forwarded to SCC while APilot is off.
+    //   - the next real MAIN=1 press is not forwarded to SCC, so S11M stays 1.
+    //   - bus0 CarState still sees the same real MAIN and engages APilot.
+    //   - MAIN release clears the guard; normal forwarding resumes.
+    // No synthetic CAN message and no timed forwarding blackout are used.
+    if (hyundai_legacy_long_requested && hyundai_scc_bus2 && (addr == 1265)) {
+      int cruise_button = GET_BYTE(to_fwd, 0) & 0x7U;
+      int main_button = GET_BIT(to_fwd, 3U);
+
+      if (cruise_button == HYUNDAI_BTN_CANCEL) {
+        hyundai_main_reengage_guard = hyundai_scc_main_on;
+        hyundai_main_reengage_main_seen = false;
+      }
+
+      // If SCC MAIN dropped by itself, do not block the next physical MAIN.
+      if (hyundai_main_reengage_guard && !hyundai_scc_main_on) {
+        hyundai_main_reengage_guard = false;
+        hyundai_main_reengage_main_seen = false;
+      }
+
+      if (hyundai_main_reengage_guard) {
+        if (main_button != 0) {
+          // Suppress all frames of the one physical MAIN press.
+          bus_fwd = -1;
+          hyundai_main_reengage_main_seen = true;
+        } else if (hyundai_main_reengage_main_seen) {
+          // Forward idle MAIN release and return to the normal path.
+          hyundai_main_reengage_guard = false;
+          hyundai_main_reengage_main_seen = false;
+        } else if (
+          (cruise_button == HYUNDAI_BTN_RESUME) ||
+          (cruise_button == HYUNDAI_BTN_SET) ||
+          (cruise_button == 3)  // GAP_DIST
+        ) {
+          // After CANCEL, these belong to APilot and must not wake stock SCC
+          // before the driver explicitly re-engages with CRUISE MAIN.
+          bus_fwd = -1;
+        } else {
+          // CANCEL and idle frames continue to forward normally.
+        }
       }
     }
   }
@@ -405,9 +465,13 @@ static int hyundai_fwd_hook(int bus_num, int addr) {
   return bus_fwd;
 }
 
-static const addr_checks* hyundai_init(uint16_t param) {
+static const addr_checks* hyundai_init(int16_t param) {
   hyundai_common_init(param);
   hyundai_legacy = false;
+  hyundai_legacy_long_requested = false;
+  hyundai_scc_main_on = false;
+  hyundai_main_reengage_guard = false;
+  hyundai_main_reengage_main_seen = false;
 
   if (hyundai_camera_scc) {
     hyundai_longitudinal = false;
@@ -423,10 +487,16 @@ static const addr_checks* hyundai_init(uint16_t param) {
   return &hyundai_rx_checks;
 }
 
-static const addr_checks* hyundai_legacy_init(uint16_t param) {
+static const addr_checks* hyundai_legacy_init(int16_t param) {
   hyundai_common_init(param);
   hyundai_legacy = true;
+  // Capture the requested OP-long flag before legacy mode intentionally
+  // switches the standard longitudinal safety state back off.
+  hyundai_legacy_long_requested = hyundai_longitudinal;
   hyundai_longitudinal = false;
+  hyundai_scc_main_on = false;
+  hyundai_main_reengage_guard = false;
+  hyundai_main_reengage_main_seen = false;
   hyundai_camera_scc = false;
 
   hyundai_rx_checks = (addr_checks){hyundai_legacy_addr_checks, HYUNDAI_LEGACY_ADDR_CHECK_LEN};
