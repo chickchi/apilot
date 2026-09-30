@@ -805,6 +805,9 @@ class CarInterface(CarInterfaceBase):
             car.CarParams.SafetyModel.hyundaiLegacy
           )
         ]
+        # v1.8.6: scope the bounded CLU11 proxy/suppression logic to this
+        # exact legacy SCC-bus2 topology.
+        ret.safetyConfigs[0].safetyParam |= Panda.FLAG_HYUNDAI_SCC_BUS2
 
     if ret.openpilotLongitudinalControl:
       ret.safetyConfigs[
@@ -957,25 +960,29 @@ class CarInterface(CarInterfaceBase):
         )
 
     # -------------------------------------------------------------
-    # v1.8 Legacy HKG-style MAIN engage
+    # v1.8.6 HKG-style button ownership for classic CAN + OP long + SCC bus2.
     #
-    # Classic CAN + OP longitudinal only.
+    # CRUISE MAIN : APilot/Lateral ON/OFF
+    # CANCEL      : APilot/Lateral OFF
+    # SET / RES   : never engage APilot; when APilot is already enabled they
+    #               are consumed by cruise_helper for LongControl/speed.
     #
-    # MAIN release:
-    #   APilot / Lateral Engage
-    #
-    # SET(-):
-    #   Long Control ON at current speed
-    #
-    # CAN-FD / HDA2 remains unchanged.
+    # Suppress BOTH generic buttonEnable and pcmMode/ACCMode rising-edge
+    # engagement in this mode.  Otherwise SET can still engage the whole
+    # controls state through SCC12.ACCMode.
     # -------------------------------------------------------------
-    legacy_main_engage = (
+    classic_main_events = (
       self.CS.CP.openpilotLongitudinalControl and
       self.CS.CP.carFingerprint not in CANFD_CAR
     )
+    legacy_hkg_buttons = (
+      classic_main_events and
+      self.CS.CP.sccBus == 2
+    )
 
+    # Preserve the existing MAIN ButtonEvent on every classic OP-long port.
     if (
-      legacy_main_engage and
+      classic_main_events and
       self.CS.main_buttons[-1] !=
       self.CS.prev_main_buttons
     ):
@@ -989,44 +996,66 @@ class CarInterface(CarInterfaceBase):
 
     ret.buttonEvents = buttonEvents
 
-    # User intent.
-    #
-    # main_buttons is a deque, therefore after MAIN release the recent
-    # pressed state remains visible long enough for allow_enable.
-    allow_enable = (
-      any(
-        btn in ENABLE_BUTTONS
-        for btn in self.CS.cruise_buttons
-      ) or
-      any(
-        self.CS.main_buttons
+    if legacy_hkg_buttons:
+      # No automatic/full engagement from SET, RES, or SCC12 ACCMode.
+      events = self.create_common_events(
+        ret,
+        pcm_enable=self.CS.CP.pcmCruise,
+        allow_enable=False,
+        enable_buttons=(),
       )
-    )
 
-    # Default APilot:
-    # RES/SET release can engage.
-    #
-    # Legacy HKG mode:
-    # MAIN release can engage too.
-    if legacy_main_engage:
-      enable_buttons = (
-        ButtonType.accelCruise,
-        ButtonType.decelCruise,
-        ButtonType.altButton3,
+      main_released = any(
+        b.type == ButtonType.altButton3 and not b.pressed
+        for b in buttonEvents
       )
+      cancel_pressed = any(
+        b.type == ButtonType.cancel and b.pressed
+        for b in buttonEvents
+      )
+
+      # MAIN is a true APilot toggle. CANCEL is immediate full disengage.
+      if cancel_pressed:
+        events.add(EventName.buttonCancel)
+      elif main_released:
+        if c.enabled:
+          events.add(EventName.buttonCancel)
+        else:
+          events.add(EventName.buttonEnable)
 
     else:
-      enable_buttons = (
-        ButtonType.accelCruise,
-        ButtonType.decelCruise,
+      # Preserve pre-v1.8.6 behavior for every other configuration.
+      allow_enable = (
+        any(
+          btn in ENABLE_BUTTONS
+          for btn in self.CS.cruise_buttons
+        ) or
+        (
+          any(self.CS.main_buttons)
+          if classic_main_events
+          else False
+        )
       )
 
-    events = self.create_common_events(
-      ret,
-      pcm_enable=self.CS.CP.pcmCruise,
-      allow_enable=allow_enable,
-      enable_buttons=enable_buttons,
-    )
+      enable_buttons = (
+        (
+          ButtonType.accelCruise,
+          ButtonType.decelCruise,
+          ButtonType.altButton3,
+        )
+        if classic_main_events
+        else (
+          ButtonType.accelCruise,
+          ButtonType.decelCruise,
+        )
+      )
+
+      events = self.create_common_events(
+        ret,
+        pcm_enable=self.CS.CP.pcmCruise,
+        allow_enable=allow_enable,
+        enable_buttons=enable_buttons,
+      )
 
     # low speed steer alert hysteresis
     if (
