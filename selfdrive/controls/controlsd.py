@@ -593,6 +593,16 @@ class Controls:
     """Compute conditional state transitions and execute actions on state transitions"""
 
 
+    # v1.8.6: in classic Hyundai SCC-bus2 OP-long mode, APilot engagement
+    # ownership belongs exclusively to the physical CRUISE MAIN button.
+    # SET/RES are longitudinal/speed controls only after APilot is enabled.
+    legacy_hkg_buttons = (
+      self.CP.carName == "hyundai" and
+      self.CP.openpilotLongitudinalControl and
+      getattr(self.CP, "sccBus", -1) == 2
+    )
+
+
     # apilot은 cruise_helper에서 처리함..
     #self.v_cruise_helper.update_v_cruise(CS, self.enabled, self.is_metric)
 
@@ -688,7 +698,21 @@ class Controls:
         self.autoEngageCounter -= 1
       elif self.autoEngageCounter == 0 and self.enableAutoEngage>0:
         autoEngage = True
-      if self.events.any(ET.ENABLE) or autoEngage:
+
+      # HKG button ownership: no automatic/full engagement from SET/RES,
+      # SCC12 ACCMode, or APilot auto-engage.  A MAIN release must be present
+      # in the same frame as the enable event.
+      main_release_request = any(
+        b.type == ButtonType.altButton3 and not b.pressed
+        for b in CS.buttonEvents
+      )
+      if legacy_hkg_buttons:
+        autoEngage = False
+        enable_request = self.events.any(ET.ENABLE) and main_release_request
+      else:
+        enable_request = self.events.any(ET.ENABLE)
+
+      if enable_request or autoEngage:
         if self.events.any(ET.NO_ENTRY):
           self.current_alert_types.append(ET.NO_ENTRY)        
 
@@ -736,16 +760,16 @@ class Controls:
           self.current_alert_types.append(ET.ENABLE)
 
 
-          if main_engage:
-            # MAIN은 APilot/Lateral만 engage.
-            # 목표속도 SET 및 LongControl 활성은 하지 않는다.
+          if legacy_hkg_buttons or main_engage:
+            # CRUISE MAIN only engages APilot/Lateral.  LongControl remains
+            # OFF until SET/RES is processed by cruise_helper while enabled.
             self.cruise_helper.longActiveUser = 0
             self.cruise_helper.userCruisePaused = False
             self.cruise_helper.auto_cruise_control = False
 
 
           else:
-            # SET/RES 또는 기존 AutoEngage 경로.
+            # Preserve existing behavior outside the HKG SCC-bus2 mode.
             self.v_cruise_helper.initialize_v_cruise(CS)
 
 
