@@ -103,15 +103,17 @@ AddrCheckStruct hyundai_legacy_addr_checks[] = {
 
 bool hyundai_legacy = false;
 
-// v1.8.7-HKG:
+// v1.8.8-HKG:
 // Legacy safety intentionally clears hyundai_longitudinal after init, so keep
 // the originally requested OP-long flag only to scope this SCC-bus2 behavior.
 bool hyundai_legacy_long_requested = false;
 
-// Received OEM SCC MAIN state and one-shot re-engage forwarding guard.
+// Received OEM SCC MAIN state.  MAIN forwarding is ON-only.
+// Decide once at the start of each physical MAIN press whether that whole
+// press is forwarded (S11M was 0) or suppressed (S11M was already 1).
 bool hyundai_scc_main_on = false;
-bool hyundai_main_reengage_guard = false;
-bool hyundai_main_reengage_main_seen = false;
+bool hyundai_main_fwd_prev = false;
+bool hyundai_main_fwd_this_press = false;
 
 addr_checks hyundai_rx_checks = {hyundai_addr_checks, HYUNDAI_ADDR_CHECK_LEN};
 
@@ -387,51 +389,45 @@ static int hyundai_fwd_hook(int bus_num, CANPacket_t *to_fwd) {
       }
     }
 
-    // v1.8.7-HKG MAIN phase guard for legacy + OP-long + SCC bus2.
+    // v1.8.8-HKG ON-only button forwarding for legacy + OP-long + SCC bus2.
     //
-    // CANCEL is forwarded normally. If OEM MainMode_ACC is still ON when
-    // CANCEL is pressed, preserve that phase until the next explicit MAIN:
-    //   - SET/RES/GAP are not forwarded to SCC while APilot is off.
-    //   - the next real MAIN=1 press is not forwarded to SCC, so S11M stays 1.
-    //   - bus0 CarState still sees the same real MAIN and engages APilot.
-    //   - MAIN release clears the guard; normal forwarding resumes.
-    // No synthetic CAN message and no timed forwarding blackout are used.
+    // MAIN is decided once per physical press:
+    //   press starts with S11M=0 -> forward the whole press so OEM SCC arms.
+    //   press starts with S11M=1 -> suppress the whole press, preventing OFF.
+    // Release/idle frames forward normally.
+    //
+    // SET/RES/GAP are blocked only while Panda controls are fully disallowed.
+    // Therefore short CANCEL (LongControl-off, APilot still enabled) can be
+    // followed directly by SET/RES, while long CANCEL/full-OFF requires MAIN.
+    // CANCEL itself always forwards normally.
     if (hyundai_legacy_long_requested && hyundai_scc_bus2 && (addr == 1265)) {
       int cruise_button = GET_BYTE(to_fwd, 0) & 0x7U;
-      int main_button = GET_BIT(to_fwd, 3U);
+      bool main_now = GET_BIT(to_fwd, 3U) != 0;
 
-      if (cruise_button == HYUNDAI_BTN_CANCEL) {
-        hyundai_main_reengage_guard = hyundai_scc_main_on;
-        hyundai_main_reengage_main_seen = false;
+      if (main_now && !hyundai_main_fwd_prev) {
+        hyundai_main_fwd_this_press = !hyundai_scc_main_on;
       }
 
-      // If SCC MAIN dropped by itself, do not block the next physical MAIN.
-      if (hyundai_main_reengage_guard && !hyundai_scc_main_on) {
-        hyundai_main_reengage_guard = false;
-        hyundai_main_reengage_main_seen = false;
-      }
-
-      if (hyundai_main_reengage_guard) {
-        if (main_button != 0) {
-          // Suppress all frames of the one physical MAIN press.
+      if (main_now) {
+        if (!hyundai_main_fwd_this_press) {
           bus_fwd = -1;
-          hyundai_main_reengage_main_seen = true;
-        } else if (hyundai_main_reengage_main_seen) {
-          // Forward idle MAIN release and return to the normal path.
-          hyundai_main_reengage_guard = false;
-          hyundai_main_reengage_main_seen = false;
-        } else if (
-          (cruise_button == HYUNDAI_BTN_RESUME) ||
-          (cruise_button == HYUNDAI_BTN_SET) ||
-          (cruise_button == 3)  // GAP_DIST
+        }
+      } else {
+        hyundai_main_fwd_this_press = false;
+
+        if (
+          !controls_allowed &&
+          (
+            (cruise_button == HYUNDAI_BTN_RESUME) ||
+            (cruise_button == HYUNDAI_BTN_SET) ||
+            (cruise_button == 3)  // GAP_DIST
+          )
         ) {
-          // After CANCEL, these belong to APilot and must not wake stock SCC
-          // before the driver explicitly re-engages with CRUISE MAIN.
           bus_fwd = -1;
-        } else {
-          // CANCEL and idle frames continue to forward normally.
         }
       }
+
+      hyundai_main_fwd_prev = main_now;
     }
   }
 
@@ -470,8 +466,8 @@ static const addr_checks* hyundai_init(int16_t param) {
   hyundai_legacy = false;
   hyundai_legacy_long_requested = false;
   hyundai_scc_main_on = false;
-  hyundai_main_reengage_guard = false;
-  hyundai_main_reengage_main_seen = false;
+  hyundai_main_fwd_prev = false;
+  hyundai_main_fwd_this_press = false;
 
   if (hyundai_camera_scc) {
     hyundai_longitudinal = false;
@@ -495,8 +491,8 @@ static const addr_checks* hyundai_legacy_init(int16_t param) {
   hyundai_legacy_long_requested = hyundai_longitudinal;
   hyundai_longitudinal = false;
   hyundai_scc_main_on = false;
-  hyundai_main_reengage_guard = false;
-  hyundai_main_reengage_main_seen = false;
+  hyundai_main_fwd_prev = false;
+  hyundai_main_fwd_this_press = false;
   hyundai_camera_scc = false;
 
   hyundai_rx_checks = (addr_checks){hyundai_legacy_addr_checks, HYUNDAI_LEGACY_ADDR_CHECK_LEN};
