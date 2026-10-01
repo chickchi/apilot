@@ -960,15 +960,15 @@ class CarInterface(CarInterfaceBase):
         )
 
     # -------------------------------------------------------------
-    # v1.8.6 HKG-style button ownership for classic CAN + OP long + SCC bus2.
+    # v1.8.8-HKG button ownership for classic CAN + OP long + SCC bus2.
     #
-    # CRUISE MAIN : APilot/Lateral ON/OFF
-    # CANCEL      : APilot/Lateral OFF
-    # SET / RES   : never engage APilot; when APilot is already enabled they
-    #               are consumed by cruise_helper for LongControl/speed.
+    # CRUISE MAIN : APilot/Lateral ON only.  It never disengages APilot.
+    # SET / RES   : never engage APilot; after MAIN they own LongControl/speed.
+    # CANCEL short: LongControl OFF only (handled in cruise_helper).
+    # CANCEL long : full APilot OFF (buttonCancel emitted by cruise_helper).
     #
     # Suppress BOTH generic buttonEnable and pcmMode/ACCMode rising-edge
-    # engagement in this mode.  Otherwise SET can still engage the whole
+    # engagement in this mode.  Otherwise SET/RES can still engage the whole
     # controls state through SCC12.ACCMode.
     # -------------------------------------------------------------
     classic_main_events = (
@@ -1009,19 +1009,14 @@ class CarInterface(CarInterfaceBase):
         b.type == ButtonType.altButton3 and not b.pressed
         for b in buttonEvents
       )
-      cancel_pressed = any(
-        b.type == ButtonType.cancel and b.pressed
-        for b in buttonEvents
-      )
 
-      # MAIN is a true APilot toggle. CANCEL is immediate full disengage.
-      if cancel_pressed:
-        events.add(EventName.buttonCancel)
-      elif main_released:
-        if c.enabled:
-          events.add(EventName.buttonCancel)
-        else:
-          events.add(EventName.buttonEnable)
+      # v1.8.8-HKG: MAIN is ON-only.
+      # If APilot is already enabled, another MAIN press/release is ignored.
+      # CANCEL ownership is intentionally left to cruise_helper:
+      #   short CANCEL -> LongControl OFF only
+      #   long  CANCEL -> full APilot OFF
+      if main_released and not c.enabled:
+        events.add(EventName.buttonEnable)
 
     else:
       # Preserve pre-v1.8.6 behavior for every other configuration.
