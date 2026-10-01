@@ -350,12 +350,33 @@ static int hyundai_tx_hook(CANPacket_t *to_send, bool longitudinal_allowed) {
   // BUTTONS: used for resume spamming and cruise cancellation
   if ((addr == 1265) && !hyundai_longitudinal) {
     int button = GET_BYTE(to_send, 0) & 0x7U;
+    int main_button = GET_BIT(to_send, 3U);
+    int bus = GET_BUS(to_send);
 
     bool allowed_resume = (button == 1) && controls_allowed;
     bool allowed_set_decel = (button == 2) && controls_allowed;
     bool allowed_cancel = (button == 4) && cruise_engaged_prev;
     bool allowed_gap_dist = (button == 3) && controls_allowed;
-    if (!(allowed_resume || allowed_set_decel || allowed_cancel || allowed_gap_dist)) {
+
+    // v1.8.9-HKG: allow exactly two MAIN-only CLU11 TX frames immediately
+    // after a long-CANCEL full-off: one on bus0 and one on bus2.
+    bool allowed_hkg_main_sync =
+      hyundai_legacy_long_requested &&
+      hyundai_scc_bus2 &&
+      (hyundai_hkg_main_sync_tx_budget > 0U) &&
+      (hyundai_hkg_main_sync_window > 0U) &&
+      (button == HYUNDAI_BTN_NONE) &&
+      (main_button != 0) &&
+      ((bus == 0) || (bus == 2));
+
+    if (allowed_hkg_main_sync) {
+      hyundai_hkg_main_sync_tx_budget--;
+      if (hyundai_hkg_main_sync_tx_budget == 0U) {
+        hyundai_hkg_main_sync_window = 0U;
+      }
+    }
+
+    if (!(allowed_resume || allowed_set_decel || allowed_cancel || allowed_gap_dist || allowed_hkg_main_sync)) {
       tx = 0;
     }
   }
@@ -405,14 +426,16 @@ static int hyundai_fwd_hook(int bus_num, CANPacket_t *to_fwd) {
       bool main_now = GET_BIT(to_fwd, 3U) != 0;
 
       if (main_now && !hyundai_main_fwd_prev) {
-        hyundai_main_fwd_this_press = !hyundai_scc_main_on;
+        // v1.8.9-HKG:
+        // Always forward the driver's real MAIN press to bus2.  Bus0 EMS sees
+        // the physical button directly, so suppressing only bus2 is what caused
+        // the v1.8.8 phase split.  If APilot is already enabled, CarController
+        // restores both OEM MAIN states ON with one synchronized pulse after
+        // release, making MAIN software-semantically ON-only.
+        hyundai_main_fwd_this_press = true;
       }
 
-      if (main_now) {
-        if (!hyundai_main_fwd_this_press) {
-          bus_fwd = -1;
-        }
-      } else {
+      if (!main_now) {
         hyundai_main_fwd_this_press = false;
 
         if (
