@@ -46,6 +46,12 @@ bool hyundai_main_button_prev = false;
 bool hyundai_main_enable_pending = false;
 uint8_t hyundai_cancel_hold_frames = 0U;
 
+// v1.8.9-HKG: post-long-CANCEL synchronized MAIN TX authorization.
+// Exactly two MAIN frames are allowed: one bus0 + one bus2.
+uint8_t hyundai_hkg_main_sync_tx_budget = 0U;
+uint8_t hyundai_hkg_main_sync_window = 0U;
+bool hyundai_hkg_scc_main_on = false;
+
 void hyundai_common_init(uint16_t param) {
   hyundai_ev_gas_signal = GET_FLAG(param, HYUNDAI_PARAM_EV_GAS);
   hyundai_hybrid_gas_signal = !hyundai_ev_gas_signal && GET_FLAG(param, HYUNDAI_PARAM_HYBRID_GAS);
@@ -66,6 +72,9 @@ void hyundai_common_init(uint16_t param) {
   hyundai_main_button_prev = false;
   hyundai_main_enable_pending = false;
   hyundai_cancel_hold_frames = 0U;
+  hyundai_hkg_main_sync_tx_budget = 0U;
+  hyundai_hkg_main_sync_window = 0U;
+  hyundai_hkg_scc_main_on = false;
 
   // A new safety session always starts disengaged in this HKG mode.
   // MAIN is the only physical control allowed to enable Panda actuation.
@@ -80,6 +89,12 @@ void hyundai_common_cruise_state_check(const int cruise_engaged) {
   // Short and long CANCEL may both leave S11M=1, so SCC11 must never force
   // controls_allowed in HKG mode.
   if (hyundai_hkg_main_control) {
+    hyundai_hkg_scc_main_on = cruise_engaged != 0;
+
+    // Do not clear a post-button synchronization budget merely because SCC
+    // MAIN is currently OFF: MAIN-while-enabled restoration is specifically
+    // authorized after the real MAIN press has toggled SCC OFF.  The budget
+    // is already bounded by hyundai_hkg_main_sync_window and driver input.
     cruise_engaged_prev = cruise_engaged;
     return;
   }
@@ -113,6 +128,15 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const int main
     const bool main_press = main_now && !hyundai_main_button_prev;
     const bool main_release = !main_now && hyundai_main_button_prev;
 
+    // Short authorization window (~160 ms at 50 Hz CLU11).  The host normally
+    // consumes the two-frame budget immediately after long-CANCEL release.
+    if (hyundai_hkg_main_sync_window > 0U) {
+      hyundai_hkg_main_sync_window--;
+      if (hyundai_hkg_main_sync_window == 0U) {
+        hyundai_hkg_main_sync_tx_budget = 0U;
+      }
+    }
+
     if (cruise_button == HYUNDAI_BTN_CANCEL) {
       // A CANCEL press immediately belongs to LongControl on the host side,
       // but Panda keeps the actuation gate open while the driver is holding
@@ -125,9 +149,12 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const int main
       const bool cancel_release = cruise_button_prev == HYUNDAI_BTN_CANCEL;
 
       if (cancel_release && (hyundai_cancel_hold_frames >= HYUNDAI_HKG_CANCEL_LONG_FRAMES)) {
-        // Long CANCEL: full APilot OFF.
+        // Long CANCEL: full APilot OFF, then permit exactly one synchronized
+        // MAIN press on bus0 and bus2 to normalize both OEM MAIN phases OFF.
         controls_allowed = false;
         hyundai_main_enable_pending = false;
+        hyundai_hkg_main_sync_tx_budget = 2U;
+        hyundai_hkg_main_sync_window = 8U;
       }
       hyundai_cancel_hold_frames = 0U;
 
@@ -136,10 +163,25 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const int main
       // it aligns with interface/controlsd MAIN-release engagement.
       if (!cancel_release) {
         if (main_press) {
+          // Any real driver MAIN press cancels stale synthetic-TX permission.
+          hyundai_hkg_main_sync_tx_budget = 0U;
+          hyundai_hkg_main_sync_window = 0U;
           hyundai_main_enable_pending = !controls_allowed;
-        } else if (main_release && hyundai_main_enable_pending) {
-          controls_allowed = true;
-          hyundai_main_enable_pending = false;
+        } else if (main_release) {
+          if (hyundai_main_enable_pending) {
+            // Only open Panda actuation if SCC actually reports MAIN ON.
+            // This keeps a failed synchronization / phase-normalization press
+            // from enabling actuation before the OEM states are aligned.
+            controls_allowed = hyundai_hkg_scc_main_on;
+            hyundai_main_enable_pending = false;
+          } else if (controls_allowed && !hyundai_hkg_scc_main_on) {
+            // MAIN was pressed while APilot was already enabled.  The physical
+            // button is visible to bus0 EMS and is now also forwarded to bus2,
+            // so both OEM MAIN states have toggled OFF.  Permit exactly one
+            // synchronized host pulse to restore both states ON.
+            hyundai_hkg_main_sync_tx_budget = 2U;
+            hyundai_hkg_main_sync_window = 8U;
+          }
         }
       }
     }
