@@ -29,18 +29,22 @@ bool hyundai_auto_engage = false;
 bool hyundai_scc_bus2 = false;
 uint8_t hyundai_last_button_interaction;  // button messages since the user pressed an enable button
 
-// v1.8.7.1-HKG:
+// v1.8.8-HKG:
 // In the classic SCC-bus2 OP-long topology, APilot engagement ownership is:
-//   MAIN    -> APilot/Lateral ON/OFF
-//   SET/RES -> LongControl/speed only
-//   CANCEL  -> APilot + LongControl OFF
+//   MAIN         -> APilot/Lateral ON only (never OFF)
+//   SET/RES      -> LongControl/speed only, after APilot is enabled
+//   CANCEL short -> LongControl OFF only
+//   CANCEL long  -> full APilot OFF
 //
 // Legacy safety intentionally clears hyundai_longitudinal after common init,
 // so remember the requested LONG+SCC_BUS2 topology here before that happens.
-// This mode must not derive Panda controls_allowed from SCC11 MainMode_ACC.
+// SCC11 MainMode_ACC is an OEM latch and must not own Panda controls_allowed.
+const uint8_t HYUNDAI_HKG_CANCEL_LONG_FRAMES = 21U;  // ~0.4 s at 50 Hz CLU11
+
 bool hyundai_hkg_main_control = false;
 bool hyundai_main_button_prev = false;
 bool hyundai_main_enable_pending = false;
+uint8_t hyundai_cancel_hold_frames = 0U;
 
 void hyundai_common_init(uint16_t param) {
   hyundai_ev_gas_signal = GET_FLAG(param, HYUNDAI_PARAM_EV_GAS);
@@ -61,6 +65,7 @@ void hyundai_common_init(uint16_t param) {
   hyundai_hkg_main_control = hyundai_longitudinal && hyundai_scc_bus2;
   hyundai_main_button_prev = false;
   hyundai_main_enable_pending = false;
+  hyundai_cancel_hold_frames = 0U;
 
   // A new safety session always starts disengaged in this HKG mode.
   // MAIN is the only physical control allowed to enable Panda actuation.
@@ -70,10 +75,10 @@ void hyundai_common_init(uint16_t param) {
 }
 
 void hyundai_common_cruise_state_check(const int cruise_engaged) {
-  // v1.8.7.1-HKG:
+  // v1.8.8-HKG:
   // MainMode_ACC is an OEM SCC latch, not APilot engagement state.
-  // After CANCEL, v1.8.7 intentionally keeps S11M=1 across the next APilot
-  // re-engage. Therefore SCC11 must never force controls_allowed in HKG mode.
+  // Short and long CANCEL may both leave S11M=1, so SCC11 must never force
+  // controls_allowed in HKG mode.
   if (hyundai_hkg_main_control) {
     cruise_engaged_prev = cruise_engaged;
     return;
@@ -108,30 +113,40 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const int main
     const bool main_press = main_now && !hyundai_main_button_prev;
     const bool main_release = !main_now && hyundai_main_button_prev;
 
-    // CANCEL always wins immediately.
     if (cruise_button == HYUNDAI_BTN_CANCEL) {
-      controls_allowed = false;
+      // A CANCEL press immediately belongs to LongControl on the host side,
+      // but Panda keeps the actuation gate open while the driver is holding
+      // the button.  Duration is classified only on physical release.
       hyundai_main_enable_pending = false;
+      if (hyundai_cancel_hold_frames < HYUNDAI_HKG_CANCEL_LONG_FRAMES) {
+        hyundai_cancel_hold_frames++;
+      }
+    } else {
+      const bool cancel_release = cruise_button_prev == HYUNDAI_BTN_CANCEL;
 
-    // For disengagement, close the Panda actuation gate immediately on MAIN
-    // press. For engagement, wait for MAIN release so it aligns with the
-    // controlsd MAIN-release engagement path.
-    } else if (main_press) {
-      if (controls_allowed) {
+      if (cancel_release && (hyundai_cancel_hold_frames >= HYUNDAI_HKG_CANCEL_LONG_FRAMES)) {
+        // Long CANCEL: full APilot OFF.
         controls_allowed = false;
         hyundai_main_enable_pending = false;
-      } else {
-        hyundai_main_enable_pending = true;
       }
+      hyundai_cancel_hold_frames = 0U;
 
-    } else if (main_release && hyundai_main_enable_pending) {
-      controls_allowed = true;
-      hyundai_main_enable_pending = false;
+      // MAIN is enable-only.  When already allowed it is a no-op; it must
+      // never close the Panda gate.  When disallowed, enable on release so
+      // it aligns with interface/controlsd MAIN-release engagement.
+      if (!cancel_release) {
+        if (main_press) {
+          hyundai_main_enable_pending = !controls_allowed;
+        } else if (main_release && hyundai_main_enable_pending) {
+          controls_allowed = true;
+          hyundai_main_enable_pending = false;
+        }
+      }
     }
 
     hyundai_main_button_prev = main_now;
 
-    // Keep the common previous-button state coherent, but SET/RES must not
+    // Keep common previous-button state coherent, but SET/RES must not
     // enable Panda controls in this HKG mode.
     cruise_button_prev = cruise_button;
     return;
