@@ -29,22 +29,16 @@ bool hyundai_auto_engage = false;
 bool hyundai_scc_bus2 = false;
 uint8_t hyundai_last_button_interaction;  // button messages since the user pressed an enable button
 
-// v1.8.8-HKG:
-// In the classic SCC-bus2 OP-long topology, APilot engagement ownership is:
-//   MAIN         -> APilot/Lateral ON only (never OFF)
-//   SET/RES      -> LongControl/speed only, after APilot is enabled
-//   CANCEL short -> LongControl OFF only
-//   CANCEL long  -> full APilot OFF
+// v1.8.10-HKG-OEM:
+// In classic SCC-bus2 OP-long mode, preserve the OEM HKG master-state model:
+//   MAIN    -> OEM cruise master ON/OFF and APilot/Lateral ON/OFF
+//   SET/RES -> LongControl engage/speed while MAIN is ON
+//   CANCEL  -> LongControl disengage only; MAIN stays ON
 //
-// Legacy safety intentionally clears hyundai_longitudinal after common init,
-// so remember the requested LONG+SCC_BUS2 topology here before that happens.
-// SCC11 MainMode_ACC is an OEM latch and must not own Panda controls_allowed.
-const uint8_t HYUNDAI_HKG_CANCEL_LONG_FRAMES = 21U;  // ~0.4 s at 50 Hz CLU11
-
+// Legacy safety clears hyundai_longitudinal after common init, so remember the
+// requested LONG+SCC_BUS2 topology here. In this mode SCC11 MainMode_ACC is the
+// authoritative Panda controls_allowed master state.
 bool hyundai_hkg_main_control = false;
-bool hyundai_main_button_prev = false;
-bool hyundai_main_enable_pending = false;
-uint8_t hyundai_cancel_hold_frames = 0U;
 
 void hyundai_common_init(uint16_t param) {
   hyundai_ev_gas_signal = GET_FLAG(param, HYUNDAI_PARAM_EV_GAS);
@@ -63,23 +57,20 @@ void hyundai_common_init(uint16_t param) {
   hyundai_scc_bus2 = GET_FLAG(param, HYUNDAI_PARAM_SCC_BUS2);
 
   hyundai_hkg_main_control = hyundai_longitudinal && hyundai_scc_bus2;
-  hyundai_main_button_prev = false;
-  hyundai_main_enable_pending = false;
-  hyundai_cancel_hold_frames = 0U;
 
-  // A new safety session always starts disengaged in this HKG mode.
-  // MAIN is the only physical control allowed to enable Panda actuation.
+  // A new safety session starts disengaged. The first valid SCC11 frame then
+  // makes controls_allowed follow the real OEM MainMode_ACC state.
   if (hyundai_hkg_main_control) {
     controls_allowed = false;
   }
 }
 
 void hyundai_common_cruise_state_check(const int cruise_engaged) {
-  // v1.8.8-HKG:
-  // MainMode_ACC is an OEM SCC latch, not APilot engagement state.
-  // Short and long CANCEL may both leave S11M=1, so SCC11 must never force
-  // controls_allowed in HKG mode.
+  // v1.8.10-HKG-OEM: SCC11 MainMode_ACC is the master state. Since the real
+  // physical MAIN is forwarded unchanged to SCC, this keeps Panda, bus0 EMS,
+  // and bus2 SCC on the same OEM ON/OFF phase without synthetic messages.
   if (hyundai_hkg_main_control) {
+    controls_allowed = cruise_engaged != 0;
     cruise_engaged_prev = cruise_engaged;
     return;
   }
@@ -109,45 +100,9 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const int main
   }
 
   if (hyundai_hkg_main_control) {
-    const bool main_now = main_button != 0;
-    const bool main_press = main_now && !hyundai_main_button_prev;
-    const bool main_release = !main_now && hyundai_main_button_prev;
-
-    if (cruise_button == HYUNDAI_BTN_CANCEL) {
-      // A CANCEL press immediately belongs to LongControl on the host side,
-      // but Panda keeps the actuation gate open while the driver is holding
-      // the button.  Duration is classified only on physical release.
-      hyundai_main_enable_pending = false;
-      if (hyundai_cancel_hold_frames < HYUNDAI_HKG_CANCEL_LONG_FRAMES) {
-        hyundai_cancel_hold_frames++;
-      }
-    } else {
-      const bool cancel_release = cruise_button_prev == HYUNDAI_BTN_CANCEL;
-
-      if (cancel_release && (hyundai_cancel_hold_frames >= HYUNDAI_HKG_CANCEL_LONG_FRAMES)) {
-        // Long CANCEL: full APilot OFF.
-        controls_allowed = false;
-        hyundai_main_enable_pending = false;
-      }
-      hyundai_cancel_hold_frames = 0U;
-
-      // MAIN is enable-only.  When already allowed it is a no-op; it must
-      // never close the Panda gate.  When disallowed, enable on release so
-      // it aligns with interface/controlsd MAIN-release engagement.
-      if (!cancel_release) {
-        if (main_press) {
-          hyundai_main_enable_pending = !controls_allowed;
-        } else if (main_release && hyundai_main_enable_pending) {
-          controls_allowed = true;
-          hyundai_main_enable_pending = false;
-        }
-      }
-    }
-
-    hyundai_main_button_prev = main_now;
-
-    // Keep common previous-button state coherent, but SET/RES must not
-    // enable Panda controls in this HKG mode.
+    // v1.8.10-HKG-OEM: do not create a second software button state machine
+    // inside Panda. SCC11 MainMode_ACC owns controls_allowed. CANCEL therefore
+    // does not close the Panda gate, and SET/RES do not open it when MAIN is off.
     cruise_button_prev = cruise_button;
     return;
   }
