@@ -100,26 +100,6 @@ def create_clu11_button(packer, frame, clu11, button, car_fingerprint):
   return packer.make_can_msg("CLU11", bus, values)
 
 
-def create_clu11_main_sync(packer, clu11, bus):
-  """v1.8.9-HKG: one-shot CRUISE MAIN press used only after long CANCEL.
-
-  A fresh alive counter is used on both bus0 and bus2.  Only MAIN=1 is sent;
-  the vehicle's normal CLU11 stream supplies the following MAIN=0/release.
-  """
-  values = copy.copy(clu11)
-  values["CF_Clu_CruiseSwState"] = 0
-  values["CF_Clu_CruiseSwMain"] = 1
-  values["CF_Clu_AliveCnt1"] = (int(values.get("CF_Clu_AliveCnt1", 0)) + 1) % 0x10
-  return packer.make_can_msg("CLU11", bus, values)
-
-
-def create_clu11_main_sync_pair(packer, clu11):
-  # Keep bus0 EMS/ESC and bus2 SCC MAIN phases aligned.
-  return [
-    create_clu11_main_sync(packer, clu11, 0),
-    create_clu11_main_sync(packer, clu11, 2),
-  ]
-
 
 def create_lfahda_mfc(packer, CC, blinking_signal):
   values = {
