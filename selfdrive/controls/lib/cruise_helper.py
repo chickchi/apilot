@@ -49,8 +49,9 @@ ButtonPrev = ButtonType.unknown
 ButtonCnt = 0
 LongPressed = False
 
-# v1.8.8-HKG: controlsd runs at ~100 Hz, so >40 frames is about 0.4 s.
-# Short CANCEL pauses LongControl only; a held CANCEL escalates to full OFF.
+# controlsd runs at ~100 Hz, so >40 frames is about 0.4 s.
+# v1.8.10-HKG-OEM keeps OEM CANCEL semantics in HKG mode: CANCEL always
+# disengages LongControl only, regardless of press duration.
 CRUISE_LONG_PRESS_FRAMES = 40
 
 
@@ -335,6 +336,17 @@ class CruiseHelper:
 
     button_type = 0
     if enabled:
+      # v1.8.10-HKG-OEM: when MAIN is pressed while APilot is ON, remove
+      # LongControl immediately. interface.py will toggle the AP master OFF
+      # on MAIN release. This guarantees the next MAIN starts lateral-only.
+      if legacy_hkg_buttons and any(
+        b.type == ButtonType.altButton3 and b.pressed
+        for b in buttonEvents
+      ):
+        self.cruise_control(controls, CS, 0, v_cruise_kph)
+        self.userCruisePaused = False
+        self.auto_cruise_control = False
+
       if ButtonCnt > 0:
         ButtonCnt += 1
       for b in buttonEvents:
@@ -342,27 +354,19 @@ class CruiseHelper:
           ButtonCnt = 1
           ButtonPrev = b.type
 
-          # v1.8.8-HKG: CANCEL always removes longitudinal control
-          # immediately on press.  Whether APilot/Lateral also turns off is
-          # decided only on release after measuring the hold duration.
+          # v1.8.10-HKG-OEM: OEM CANCEL disengages longitudinal control
+          # immediately but never owns APilot/Lateral master state.
           if legacy_hkg_buttons and b.type == ButtonType.cancel:
             self.cruise_control(controls, CS, 0, v_cruise_kph)
             self.userCruisePaused = False
             self.auto_cruise_control = False
         elif not b.pressed and ButtonCnt > 0:
           if b.type == ButtonType.cancel:
-            if legacy_hkg_buttons and LongPressed:
-              # Held CANCEL: longitudinal was already removed on press;
-              # release now escalates to a full APilot disengage.
-              self.longActiveUser = 0
-              self.userCruisePaused = False
-              self.auto_cruise_control = False
-              controls.events.add(EventName.buttonCancel)
-            else:
-              # Short CANCEL: LongControl OFF only, Lateral/APilot stays ON.
-              self.cruise_control(controls, CS, 0, v_cruise_kph)
-              self.userCruisePaused = False
-              self.auto_cruise_control = False
+            # v1.8.10-HKG-OEM: short or long CANCEL has the same OEM meaning:
+            # LongControl OFF only. MAIN is the sole APilot master toggle.
+            self.cruise_control(controls, CS, 0, v_cruise_kph)
+            self.userCruisePaused = False
+            self.auto_cruise_control = False
           elif not LongPressed and b.type == ButtonType.accelCruise:
             v_cruise_kph += button_speed_up_diff if metric else button_speed_up_diff * CV.MPH_TO_KPH
             button_type = ButtonType.accelCruise
@@ -382,12 +386,11 @@ class CruiseHelper:
         V_CRUISE_DELTA = 10
         if ButtonPrev == ButtonType.cancel:
            if legacy_hkg_buttons:
-             # v1.8.8-HKG: reaching the threshold only marks LongPressed.
-             # Full disengage is emitted on physical release so Panda and
-             # controlsd classify the same completed button press.
+             # v1.8.10-HKG-OEM: held CANCEL remains LongControl-off only.
+             # Keep tracking until physical release, with no full AP disengage.
              pass
            else:
-             # Preserve the pre-v1.8.8 behavior outside HKG SCC-bus2 mode.
+             # Preserve existing behavior outside HKG SCC-bus2 mode.
              self.longActiveUser = 0
              controls.events.add(EventName.buttonCancel)
              ButtonCnt = 0
