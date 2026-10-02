@@ -960,16 +960,15 @@ class CarInterface(CarInterfaceBase):
         )
 
     # -------------------------------------------------------------
-    # v1.8.8-HKG button ownership for classic CAN + OP long + SCC bus2.
+    # v1.8.10-HKG-OEM button ownership for classic CAN + OP long + SCC bus2.
     #
-    # CRUISE MAIN : APilot/Lateral ON only.  It never disengages APilot.
-    # SET / RES   : never engage APilot; after MAIN they own LongControl/speed.
-    # CANCEL short: LongControl OFF only (handled in cruise_helper).
-    # CANCEL long : full APilot OFF (buttonCancel emitted by cruise_helper).
+    # Match the OEM HKG button model as closely as possible:
+    #   CRUISE MAIN : master ON/OFF toggle for APilot/Lateral + OEM cruise MAIN
+    #   SET / RES   : LongControl engage/speed only while MAIN is ON
+    #   CANCEL      : LongControl disengage only; OEM MAIN stays ON
     #
-    # Suppress BOTH generic buttonEnable and pcmMode/ACCMode rising-edge
-    # engagement in this mode.  Otherwise SET/RES can still engage the whole
-    # controls state through SCC12.ACCMode.
+    # Suppress generic SET/RES and SCC12/pcm engagement of the whole AP state.
+    # MAIN is the only button that toggles APilot/Lateral.
     # -------------------------------------------------------------
     classic_main_events = (
       self.CS.CP.openpilotLongitudinalControl and
@@ -1010,13 +1009,13 @@ class CarInterface(CarInterfaceBase):
         for b in buttonEvents
       )
 
-      # v1.8.8-HKG: MAIN is ON-only.
-      # If APilot is already enabled, another MAIN press/release is ignored.
-      # CANCEL ownership is intentionally left to cruise_helper:
-      #   short CANCEL -> LongControl OFF only
-      #   long  CANCEL -> full APilot OFF
-      if main_released and not c.enabled:
-        events.add(EventName.buttonEnable)
+      # v1.8.10-HKG-OEM: MAIN is a true OEM-style master toggle.
+      # CANCEL ownership stays in cruise_helper and only disengages LongControl.
+      if main_released:
+        if c.enabled:
+          events.add(EventName.buttonCancel)
+        else:
+          events.add(EventName.buttonEnable)
 
     else:
       # Preserve pre-v1.8.6 behavior for every other configuration.
