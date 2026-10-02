@@ -103,17 +103,9 @@ AddrCheckStruct hyundai_legacy_addr_checks[] = {
 
 bool hyundai_legacy = false;
 
-// v1.8.8-HKG:
-// Legacy safety intentionally clears hyundai_longitudinal after init, so keep
-// the originally requested OP-long flag only to scope this SCC-bus2 behavior.
-bool hyundai_legacy_long_requested = false;
-
-// Received OEM SCC MAIN state.  MAIN forwarding is ON-only.
-// Decide once at the start of each physical MAIN press whether that whole
-// press is forwarded (S11M was 0) or suppressed (S11M was already 1).
-bool hyundai_scc_main_on = false;
-bool hyundai_main_fwd_prev = false;
-bool hyundai_main_fwd_this_press = false;
+// v1.8.10-HKG-OEM: no HKG-specific MAIN forwarding state is required.
+// Physical CLU11 is forwarded unchanged so bus0 EMS and bus2 SCC see the same
+// OEM MAIN press and remain phase-aligned.
 
 addr_checks hyundai_rx_checks = {hyundai_addr_checks, HYUNDAI_ADDR_CHECK_LEN};
 
@@ -210,7 +202,6 @@ static int hyundai_rx_hook(CANPacket_t *to_push) {
   if (valid && (addr == 1056)) { // MainMode_ACC
     // 1 bit: 0
     int cruise_available = GET_BIT(to_push, 0U);
-    hyundai_scc_main_on = cruise_available != 0;
     hyundai_common_cruise_state_check(cruise_available);
   }
 
@@ -389,46 +380,9 @@ static int hyundai_fwd_hook(int bus_num, CANPacket_t *to_fwd) {
       }
     }
 
-    // v1.8.8-HKG ON-only button forwarding for legacy + OP-long + SCC bus2.
-    //
-    // MAIN is decided once per physical press:
-    //   press starts with S11M=0 -> forward the whole press so OEM SCC arms.
-    //   press starts with S11M=1 -> suppress the whole press, preventing OFF.
-    // Release/idle frames forward normally.
-    //
-    // SET/RES/GAP are blocked only while Panda controls are fully disallowed.
-    // Therefore short CANCEL (LongControl-off, APilot still enabled) can be
-    // followed directly by SET/RES, while long CANCEL/full-OFF requires MAIN.
-    // CANCEL itself always forwards normally.
-    if (hyundai_legacy_long_requested && hyundai_scc_bus2 && (addr == 1265)) {
-      int cruise_button = GET_BYTE(to_fwd, 0) & 0x7U;
-      bool main_now = GET_BIT(to_fwd, 3U) != 0;
-
-      if (main_now && !hyundai_main_fwd_prev) {
-        hyundai_main_fwd_this_press = !hyundai_scc_main_on;
-      }
-
-      if (main_now) {
-        if (!hyundai_main_fwd_this_press) {
-          bus_fwd = -1;
-        }
-      } else {
-        hyundai_main_fwd_this_press = false;
-
-        if (
-          !controls_allowed &&
-          (
-            (cruise_button == HYUNDAI_BTN_RESUME) ||
-            (cruise_button == HYUNDAI_BTN_SET) ||
-            (cruise_button == 3)  // GAP_DIST
-          )
-        ) {
-          bus_fwd = -1;
-        }
-      }
-
-      hyundai_main_fwd_prev = main_now;
-    }
+    // v1.8.10-HKG-OEM: do not suppress or rewrite physical CLU11 buttons.
+    // The normal bus0 -> bus2 forwarding path above carries MAIN/SET/RES/CANCEL
+    // exactly as the OEM vehicle emits them.
   }
 
   if (bus_num == 2) {
@@ -464,10 +418,6 @@ static int hyundai_fwd_hook(int bus_num, CANPacket_t *to_fwd) {
 static const addr_checks* hyundai_init(int16_t param) {
   hyundai_common_init(param);
   hyundai_legacy = false;
-  hyundai_legacy_long_requested = false;
-  hyundai_scc_main_on = false;
-  hyundai_main_fwd_prev = false;
-  hyundai_main_fwd_this_press = false;
 
   if (hyundai_camera_scc) {
     hyundai_longitudinal = false;
@@ -486,13 +436,9 @@ static const addr_checks* hyundai_init(int16_t param) {
 static const addr_checks* hyundai_legacy_init(int16_t param) {
   hyundai_common_init(param);
   hyundai_legacy = true;
-  // Capture the requested OP-long flag before legacy mode intentionally
-  // switches the standard longitudinal safety state back off.
-  hyundai_legacy_long_requested = hyundai_longitudinal;
+  // Legacy mode intentionally switches the standard longitudinal safety state
+  // back off. hyundai_hkg_main_control was already latched in common init.
   hyundai_longitudinal = false;
-  hyundai_scc_main_on = false;
-  hyundai_main_fwd_prev = false;
-  hyundai_main_fwd_this_press = false;
   hyundai_camera_scc = false;
 
   hyundai_rx_checks = (addr_checks){hyundai_legacy_addr_checks, HYUNDAI_LEGACY_ADDR_CHECK_LEN};
