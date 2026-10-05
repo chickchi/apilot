@@ -41,6 +41,7 @@ Ecu = car.CarParams.Ecu
 
 ButtonType = car.CarState.ButtonEvent.Type
 EventName = car.CarEvent.EventName
+GearShifter = car.CarState.GearShifter
 
 
 ENABLE_BUTTONS = (
@@ -960,15 +961,21 @@ class CarInterface(CarInterfaceBase):
         )
 
     # -------------------------------------------------------------
-    # v1.8.10-HKG-OEM button ownership for classic CAN + OP long + SCC bus2.
+    # v1.8.11-HKG-OEM button ownership for classic CAN + OP long + SCC bus2.
     #
-    # Match the OEM HKG button model as closely as possible:
-    #   CRUISE MAIN : master ON/OFF toggle for APilot/Lateral + OEM cruise MAIN
-    #   SET / RES   : LongControl engage/speed only while MAIN is ON
-    #   CANCEL      : LongControl disengage only; OEM MAIN stays ON
+    # The OEM SCC11 MainMode_ACC bit is the authoritative cruise-master state.
+    # Do NOT infer MAIN ON/OFF from c.enabled: P/N/R can disable APilot while
+    # the OEM cruise master remains ON.  That was the root cause of the
+    # v1.8.10 P->D controlsMismatch sequence.
     #
-    # Suppress generic SET/RES and SCC12/pcm engagement of the whole AP state.
-    # MAIN is the only button that toggles APilot/Lateral.
+    #   MAIN result S11M=1 : OEM master ON. MAIN may enable lateral-only.
+    #   MAIN result S11M=0 : OEM master OFF. MAIN must never enable APilot.
+    #   CANCEL              : LongControl OFF only (handled in cruise_helper).
+    #   P/N/R while enabled : APilot is disabled by wrongGear, but if S11M
+    #                         remains ON, arm an OEM-style SET/RES resume.
+    #   D + SET/RES resume  : APilot + LongControl can re-engage without MAIN.
+    #
+    # Generic SET/RES and SCC12/pcm full-engagement remain suppressed.
     # -------------------------------------------------------------
     classic_main_events = (
       self.CS.CP.openpilotLongitudinalControl and
@@ -996,7 +1003,7 @@ class CarInterface(CarInterfaceBase):
     ret.buttonEvents = buttonEvents
 
     if legacy_hkg_buttons:
-      # No automatic/full engagement from SET, RES, or SCC12 ACCMode.
+      # No generic automatic/full engagement from SET, RES, or SCC12 ACCMode.
       events = self.create_common_events(
         ret,
         pcm_enable=self.CS.CP.pcmCruise,
@@ -1004,18 +1011,83 @@ class CarInterface(CarInterfaceBase):
         enable_buttons=(),
       )
 
+      # sccBus==2 uses cp_cam as cp_cruise in Hyundai CarState. Read the
+      # physical OEM master directly; ret.cruiseState.available has a TCS13
+      # fallback when S11M is OFF and therefore is not authoritative here.
+      scc_main_on = bool(
+        self.cp_cam.vl["SCC11"]["MainMode_ACC"]
+      )
+
       main_released = any(
         b.type == ButtonType.altButton3 and not b.pressed
         for b in buttonEvents
       )
+      main_held = self.CS.main_buttons[-1] != Buttons.NONE
+      set_released = any(
+        b.type == ButtonType.decelCruise and not b.pressed
+        for b in buttonEvents
+      )
+      res_released = any(
+        b.type == ButtonType.accelCruise and not b.pressed
+        for b in buttonEvents
+      )
 
-      # v1.8.10-HKG-OEM: MAIN is a true OEM-style master toggle.
-      # CANCEL ownership stays in cruise_helper and only disengages LongControl.
+      # Arm exactly the case proven by the 2026-10-05 capture:
+      # APilot was engaged, a non-D gear caused wrongGear/userDisable, while
+      # OEM MAIN/S11M remained ON.  Keep this separate from arbitrary system
+      # disengagements so SET/RES cannot wake APilot unexpectedly.
+      hkg_resume_armed = getattr(self, "hkg_resume_armed", False)
+      if c.enabled and ret.gearShifter != GearShifter.drive and scc_main_on:
+        hkg_resume_armed = True
+
+      # If MAIN itself turns the OEM master ON while the transmission is not
+      # yet reported as D, create the same one-shot gear recovery path.  This
+      # avoids requiring another P->D cycle after a legitimate wrongGear/noEntry
+      # caused by the short TCU gear-settling window seen in the capture.
+      if main_released and scc_main_on and not c.enabled and ret.gearShifter != GearShifter.drive:
+        hkg_resume_armed = True
+
+      # OEM MAIN OFF cancels all resume ownership.
+      if not scc_main_on:
+        hkg_resume_armed = False
+
+      # Once APilot is successfully back in D, the one-shot gear resume path
+      # is no longer needed.
+      if c.enabled and ret.gearShifter == GearShifter.drive:
+        hkg_resume_armed = False
+
+      # MAIN is interpreted by its resulting OEM state, never by c.enabled.
+      # This prevents the v1.8.10 failure:
+      #   AP disabled by P, S11M still 1 -> MAIN toggles S11M to 0 ->
+      #   old code incorrectly emitted buttonEnable -> EN=1/PANDA=0 mismatch.
       if main_released:
-        if c.enabled:
-          events.add(EventName.buttonCancel)
+        if scc_main_on:
+          if not c.enabled:
+            events.add(EventName.buttonEnable)
         else:
-          events.add(EventName.buttonEnable)
+          if c.enabled:
+            events.add(EventName.buttonCancel)
+
+      # If S11M disappears without a MAIN button edge, keep host/Panda master
+      # ownership coherent.  Ignore the active MAIN press itself; its release
+      # is handled above using the final OEM state.
+      elif c.enabled and not scc_main_on and not main_held:
+        events.add(EventName.buttonCancel)
+
+      # OEM-style P/N/R -> D recovery.  SET/RES is accepted only for the
+      # specifically armed gear-disengage path, only in D, and only while the
+      # OEM master is still ON.  controlsd v1.8.11 turns this enable event into
+      # APilot + LongControl, whereas normal MAIN enable remains lateral-only.
+      if (
+        hkg_resume_armed and
+        not c.enabled and
+        scc_main_on and
+        ret.gearShifter == GearShifter.drive and
+        (set_released or res_released)
+      ):
+        events.add(EventName.buttonEnable)
+
+      self.hkg_resume_armed = hkg_resume_armed
 
     else:
       # Preserve pre-v1.8.6 behavior for every other configuration.
