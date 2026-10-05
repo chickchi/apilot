@@ -699,16 +699,31 @@ class Controls:
       elif self.autoEngageCounter == 0 and self.enableAutoEngage>0:
         autoEngage = True
 
-      # HKG button ownership: no automatic/full engagement from SET/RES,
-      # SCC12 ACCMode, or APilot auto-engage.  A MAIN release must be present
-      # in the same frame as the enable event.
+      # v1.8.11 HKG button ownership.  interface.py is the authority for
+      # whether a SET/RES release is allowed to re-enable APilot after the
+      # specifically armed P/N/R -> D recovery path.  Normal HKG engagement
+      # still comes from MAIN.  Generic SET/RES/auto-engage cannot create an
+      # ENABLE event because interface.py suppresses them.
       main_release_request = any(
         b.type == ButtonType.altButton3 and not b.pressed
         for b in CS.buttonEvents
       )
+      set_release_request = any(
+        b.type == ButtonType.decelCruise and not b.pressed
+        for b in CS.buttonEvents
+      )
+      res_release_request = any(
+        b.type == ButtonType.accelCruise and not b.pressed
+        for b in CS.buttonEvents
+      )
       if legacy_hkg_buttons:
         autoEngage = False
-        enable_request = self.events.any(ET.ENABLE) and main_release_request
+        hkg_enable_button = (
+          main_release_request or
+          set_release_request or
+          res_release_request
+        )
+        enable_request = self.events.any(ET.ENABLE) and hkg_enable_button
       else:
         enable_request = self.events.any(ET.ENABLE)
 
@@ -760,18 +775,38 @@ class Controls:
           self.current_alert_types.append(ET.ENABLE)
 
 
-          if legacy_hkg_buttons or main_engage:
-            # CRUISE MAIN only engages APilot/Lateral.  LongControl remains
-            # OFF until SET/RES is processed by cruise_helper while enabled.
+          if legacy_hkg_buttons:
+            if main_engage:
+              # Normal OEM MAIN engagement is lateral-only.
+              self.cruise_helper.longActiveUser = 0
+              self.cruise_helper.userCruisePaused = False
+              self.cruise_helper.auto_cruise_control = False
+
+            elif set_engage or res_engage:
+              # v1.8.11: interface.py only emits this ENABLE event for the
+              # armed P/N/R -> D resume case while OEM MAIN/S11M is still ON.
+              # SET uses current speed; RES restores the previous set speed via
+              # initialize_v_cruise().  LongControl comes ON in the same engage.
+              self.v_cruise_helper.initialize_v_cruise(CS)
+              self.cruise_helper.longActiveUser = 1
+              self.cruise_helper.userCruisePaused = False
+              self.cruise_helper.auto_cruise_control = True
+
+            else:
+              # Defensive fallback: an HKG enable with no recognized physical
+              # owner must never bootstrap longitudinal control.
+              self.cruise_helper.longActiveUser = 0
+              self.cruise_helper.userCruisePaused = False
+              self.cruise_helper.auto_cruise_control = False
+
+          elif main_engage:
             self.cruise_helper.longActiveUser = 0
             self.cruise_helper.userCruisePaused = False
             self.cruise_helper.auto_cruise_control = False
 
-
           else:
             # Preserve existing behavior outside the HKG SCC-bus2 mode.
             self.v_cruise_helper.initialize_v_cruise(CS)
-
 
             if set_engage or res_engage or auto_engage_long:
               self.cruise_helper.longActiveUser = 1
