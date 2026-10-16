@@ -24,7 +24,7 @@ from selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from selfdrive.controls.lib.latcontrol_indi import LatControlINDI
 from selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from selfdrive.controls.lib.latcontrol_torque import LatControlTorque
-from selfdrive.controls.lib.events import Events, ET
+from selfdrive.controls.lib.events import Events, ET, EVENT_NAME
 from selfdrive.controls.lib.alertmanager import AlertManager, set_offroad_alert
 from selfdrive.controls.lib.vehicle_model import VehicleModel
 from selfdrive.locationd.calibrationd import Calibration
@@ -1266,6 +1266,49 @@ class Controls:
     self.CC = CC
 
 
+  def _hkg_diag_transition(self, CS, CC):
+    # v1.8.11-DIAG1. Read-only, state-change-only diagnostics for HKG SCC bus 2.
+    # This function never changes engagement decisions, CAN, Panda, or Params.
+    if not (self.CP.carName == "hyundai" and
+            self.CP.openpilotLongitudinalControl and
+            getattr(self.CP, "sccBus", -1) == 2):
+      return
+
+    try:
+      # Raw OEM MAIN state. CS.cruiseState.available is not authoritative
+      # because Hyundai carstate.py may fall back to TCS13 when S11M is OFF.
+      scc_main = int(self.CI.cp_cam.vl["SCC11"]["MainMode_ACC"])
+      long_user = int(self.cruise_helper.longActiveUser)
+      curr = (
+        int(bool(self.enabled)), int(bool(CC.latEnabled)),
+        int(bool(CC.longEnabled)), int(long_user > 0), scc_main,
+      )
+      old = getattr(self, "_hkg_diag_prev", None)
+      if curr == old:
+        return
+      self._hkg_diag_prev = curr
+
+      buttons = ",".join(
+        f"{str(b.type)}:{int(bool(b.pressed))}" for b in CS.buttonEvents
+      ) or "none"
+      reasons = ",".join(EVENT_NAME.get(e, str(e)) for e in self.events.names) or "none"
+      panda_allowed = ",".join(str(int(ps.controlsAllowed)) for ps in self.sm['pandaStates']) or "none"
+
+      cloudlog.warning(
+        f"HKG_DIAG1 old={old} now={curr} state={str(self.state)} "
+        f"gear={str(CS.gearShifter)} v={float(CS.vEgo):.2f} "
+        f"S11M={scc_main} pcmAvail={int(CS.cruiseState.available)} "
+        f"pcmEnabled={int(CS.cruiseState.enabled)} pandaAllowed={panda_allowed} "
+        f"canValid={int(CS.canValid)} canTimeout={int(CS.canTimeout)} "
+        f"mismatchCounter={self.mismatch_counter} "
+        f"longUser={long_user} longActive={int(CC.longActive)} "
+        f"resumeArmed={getattr(self.CI, 'hkg_resume_armed', False)} "
+        f"buttons={buttons} events={reasons}"
+      )
+    except Exception:
+      # Diagnostics must never disrupt the real-time controls path.
+      pass
+
   def step(self):
     start_time = sec_since_boot()
     self.prof.checkpoint("Ratekeeper", ignore=True)
@@ -1299,6 +1342,9 @@ class Controls:
 
     self.prof.checkpoint("State Control")
 
+
+    # Log transitions only; no new messaging subscriptions or CAN writes.
+    self._hkg_diag_transition(CS, CC)
 
     # Publish data
     self.publish_logs(CS, start_time, CC, lac_log)
