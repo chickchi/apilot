@@ -160,7 +160,36 @@ def hw_state_thread(end_event, hw_queue):
     time.sleep(DT_TRML)
 
 
-def thermald_thread(end_event, hw_queue):
+# v1.8.12-DIAG2: one-second, log-on-anomaly only watchdog.  It does not
+# affect deviceState publishing, manager startup, or any safety decision.
+# The watched thread updates a few timestamps without taking locks or writing logs.
+def thermald_diag2_mark(health, stage):
+  health['stage'] = stage
+  health['stage_ts'] = time.monotonic()
+
+
+def thermald_diag2_watchdog(end_event, health):
+  next_log = 0.0
+  while not end_event.wait(1.0):
+    try:
+      last_send = health['last_send']
+      if not last_send:
+        continue  # Initial startup is excluded until the first deviceState publish.
+      now = time.monotonic()
+      age = now - last_send
+      if age >= 3.0 and now >= next_log:
+        stage = health['stage']
+        stage_age = max(0.0, now - health['stage_ts'])
+        cloudlog.warning(
+          f"THERMAL_DIAG2_STALL age={age:.2f}s stage={stage} "
+          f"stageAge={stage_age:.2f}s publishes={health['publishes']}"
+        )
+        next_log = now + 10.0  # Never spam the log while blocked.
+    except Exception:
+      pass  # Diagnostics must not interfere with device operation.
+
+
+def thermald_thread(end_event, hw_queue, health):
   pm = messaging.PubMaster(['deviceState'])
   sm = messaging.SubMaster(["peripheralState", "gpsLocationExternal", "controlsState", "pandaStates"], poll=["pandaStates"])
 
@@ -230,13 +259,16 @@ def thermald_thread(end_event, hw_queue):
   #  battery_charging_max = int(params.get("OpkrBatteryChargingMax", encoding="utf8"))
 
   while not end_event.is_set():
+    thermald_diag2_mark(health, 'panda_wait')
     ts = sec_since_boot()
     sm.update(PANDA_STATES_TIMEOUT)
 
     pandaStates = sm['pandaStates']
     peripheralState = sm['peripheralState']
 
+    thermald_diag2_mark(health, 'read_thermal')
     msg = read_thermal(thermal_config)
+    thermald_diag2_mark(health, 'device_metrics')
 
     # neokii
     if sec_since_boot() - restart_triggered_ts < 5.:
@@ -416,6 +448,7 @@ def thermald_thread(end_event, hw_queue):
       hotspot_run = True
 
     # Offroad power monitoring
+    thermald_diag2_mark(health, 'power_monitor')
     power_monitor.calculate(peripheralState, onroad_conditions["ignition"])
     msg.deviceState.offroadPowerUsageUwh = power_monitor.get_power_used()
     msg.deviceState.carBatteryCapacityUwh = max(0, power_monitor.get_car_battery_capacity())
@@ -443,7 +476,16 @@ def thermald_thread(end_event, hw_queue):
       msg.deviceState.lastAthenaPingTime = int(last_ping)
 
     msg.deviceState.thermalStatus = thermal_status
+    thermald_diag2_mark(health, 'device_publish')
     pm.send("deviceState", msg)
+    published_at = time.monotonic()
+    previous_send = health['last_send']
+    health['last_send'] = published_at
+    health['publishes'] += 1
+    # Rare recovery log, NOT a log on every successful publish.
+    if previous_send and published_at - previous_send >= 3.0:
+      cloudlog.warning(f"THERMAL_DIAG2_GAP gap={published_at-previous_send:.2f}s publishes={health['publishes']}")
+    thermald_diag2_mark(health, 'post_publish')
 
     if EON and not is_uno:
       set_offroad_alert_if_changed("Offroad_ChargeDisabled", (not usb_power))
@@ -473,10 +515,12 @@ def thermald_thread(end_event, hw_queue):
     statlog.gauge("screen_brightness_percent", msg.deviceState.screenBrightnessPercent)
 
     # atom
+    thermald_diag2_mark(health, 'charging_ctrl')
     if usb_power and battery_charging_control:
       power_monitor.charging_ctrl(msg, ts, battery_charging_max, battery_charging_min)
 
     # report to server once every 10 minutes
+    thermald_diag2_mark(health, 'stats_or_status')
     if (count % int(600. / DT_TRML)) == 0:
       if EON and started_ts is None and msg.deviceState.memoryUsagePercent > 40:
         cloudlog.event("High offroad memory usage", mem=msg.deviceState.memoryUsagePercent)
@@ -488,18 +532,22 @@ def thermald_thread(end_event, hw_queue):
                      location=(strip_deprecated_keys(sm["gpsLocationExternal"].to_dict()) if sm.alive["gpsLocationExternal"] else None),
                      deviceState=strip_deprecated_keys(msg.to_dict()))
 
+    thermald_diag2_mark(health, 'loop_end')
     count += 1
 
 
 def main():
   hw_queue = queue.Queue(maxsize=1)
   end_event = threading.Event()
+  health = {'last_send': 0.0, 'publishes': 0, 'stage': 'starting', 'stage_ts': time.monotonic()}
 
   threads = [
     threading.Thread(target=hw_state_thread, args=(end_event, hw_queue)),
-    threading.Thread(target=thermald_thread, args=(end_event, hw_queue)),
+    threading.Thread(target=thermald_thread, args=(end_event, hw_queue, health)),
   ]
-
+  # Passive 1Hz watchdog; outside publisher's thread, without CAN or API writes.
+  diag_watchdog = threading.Thread(target=thermald_diag2_watchdog, args=(end_event, health), daemon=True)
+  diag_watchdog.start()
   for t in threads:
     t.start()
 
@@ -513,6 +561,7 @@ def main():
 
   for t in threads:
     t.join()
+  diag_watchdog.join(timeout=1.0)
 
 
 if __name__ == "__main__":
