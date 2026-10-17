@@ -1123,6 +1123,7 @@ class Controls:
     alerts = self.events.create_alerts(self.current_alert_types, [self.CP, CS, self.sm, self.is_metric, self.soft_disable_timer])
     self.AM.add_many(self.sm.frame, alerts)
     current_alert = self.AM.process_alerts(self.sm.frame, clear_event_types)
+    self._hkg_diag2_alert(current_alert)
     if current_alert:
       hudControl.visualAlert = current_alert.visual_alert
 
@@ -1309,6 +1310,46 @@ class Controls:
       # Diagnostics must never disrupt the real-time controls path.
       pass
 
+  def _hkg_diag2_state(self):
+    # v1.8.12-DIAG2.  Edge triggered: no continuous state logging at 100Hz.
+    try:
+      now = (str(self.state), bool(self.sm.alive.get('deviceState', False)))
+      old = getattr(self, '_hkg_diag2_state_prev', None)
+      if now == old:
+        return
+      self._hkg_diag2_state_prev = now
+      if old is None:
+        return
+      last_rcv = self.sm.rcv_time.get('deviceState', 0.0)
+      age = (sec_since_boot() - last_rcv) if last_rcv else -1.0
+      events = ','.join(EVENT_NAME.get(e, str(e)) for e in self.events.names) or 'none'
+      cloudlog.warning(
+        f"HKG_DIAG2_STATE old={old} now={now} devAge={age:.2f}s "
+        f"softTimer={self.soft_disable_timer} alerts={self.current_alert_types} "
+        f"events={events}"
+      )
+    except Exception:
+      pass
+
+  def _hkg_diag2_alert(self, current_alert):
+    # Records what controlsd ASKED soundd to play, not speaker output.
+    try:
+      soft_now = self.state == State.softDisabling
+      soft_before = getattr(self, '_hkg_diag2_alert_was_soft', False)
+      self._hkg_diag2_alert_was_soft = soft_now
+      if not (soft_now or soft_before):
+        return  # Zero string formatting while normally driving.
+      sound = str(current_alert.audible_alert) if current_alert else 'none'
+      alert_type = str(current_alert.alert_type) if current_alert else 'none'
+      now = (str(self.state), sound, alert_type)
+      old = getattr(self, '_hkg_diag2_alert_prev', None)
+      if old == now:
+        return
+      self._hkg_diag2_alert_prev = now
+      cloudlog.warning(f"HKG_DIAG2_ALERT old={old} now={now}")
+    except Exception:
+      pass
+
   def step(self):
     start_time = sec_since_boot()
     self.prof.checkpoint("Ratekeeper", ignore=True)
@@ -1333,6 +1374,7 @@ class Controls:
     if not self.read_only and self.initialized:
       # Update control state
       self.state_transition(CS)
+      self._hkg_diag2_state()
       self.prof.checkpoint("State transition")
 
 
