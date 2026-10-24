@@ -160,12 +160,23 @@ def hw_state_thread(end_event, hw_queue):
     time.sleep(DT_TRML)
 
 
-# v1.8.12-DIAG2: one-second, log-on-anomaly only watchdog.  It does not
-# affect deviceState publishing, manager startup, or any safety decision.
-# The watched thread updates a few timestamps without taking locks or writing logs.
+# v1.8.13-DIAG3: 1Hz watchdog inherited from DIAG2, plus ultra-light
+# stage markers around device_metrics.  No exception swallowing or timeouts
+# are added to hardware calls: this is observation only, not a safety bypass.
 def thermald_diag2_mark(health, stage):
+  now = time.monotonic()
+  old_stage = health['stage']
+  spent = now - health['stage_ts']
+  # One recovery log after a slow *completed* stage.  The watchdog still
+  # captures the stage name if a blocking call never returns.
   health['stage'] = stage
-  health['stage_ts'] = time.monotonic()
+  health['stage_ts'] = now
+  if old_stage and spent >= 1.25 and now >= health['next_slow_log']:
+    health['next_slow_log'] = now + 15.0
+    cloudlog.warning(
+      f"THERMAL_DIAG3_SLOW stage={old_stage} duration={spent:.2f}s "
+      f"next={stage} publishes={health['publishes']}"
+    )
 
 
 def thermald_diag2_watchdog(end_event, health):
@@ -271,6 +282,7 @@ def thermald_thread(end_event, hw_queue, health):
     thermald_diag2_mark(health, 'device_metrics')
 
     # neokii
+    thermald_diag2_mark(health, 'restart_params')
     if sec_since_boot() - restart_triggered_ts < 5.:
       onroad_conditions["not_restart_triggered"] = False
     else:
@@ -280,6 +292,7 @@ def thermald_thread(end_event, hw_queue, health):
         params.put_bool("SoftRestartTriggered", False)
         restart_triggered_ts = sec_since_boot()
 
+    thermald_diag2_mark(health, 'ignition_state')
     if sm.updated['pandaStates'] and len(pandaStates) > 0:
 
       # Set ignition based on any panda connected
@@ -320,16 +333,22 @@ def thermald_thread(end_event, hw_queue, health):
         cloudlog.error("Lost panda connection while onroad")
       onroad_conditions["ignition"] = False
 
+    thermald_diag2_mark(health, 'hw_state_queue')
     try:
       last_hw_state = hw_queue.get_nowait()
     except queue.Empty:
       pass
 
+    thermald_diag2_mark(health, 'free_space')
     msg.deviceState.freeSpacePercent = get_available_percent(default=100.0)
+    thermald_diag2_mark(health, 'memory_usage')
     msg.deviceState.memoryUsagePercent = int(round(psutil.virtual_memory().percent))
+    thermald_diag2_mark(health, 'cpu_usage')
     msg.deviceState.cpuUsagePercent = [int(round(n)) for n in psutil.cpu_percent(percpu=True)]
+    thermald_diag2_mark(health, 'gpu_usage')
     msg.deviceState.gpuUsagePercent = int(round(HARDWARE.get_gpu_usage_percent()))
 
+    thermald_diag2_mark(health, 'network_copy')
     msg.deviceState.networkType = last_hw_state.network_type
     msg.deviceState.networkMetered = last_hw_state.network_metered
     msg.deviceState.networkStrength = last_hw_state.network_strength
@@ -340,12 +359,17 @@ def thermald_thread(end_event, hw_queue, health):
     msg.deviceState.modemTempC = last_hw_state.modem_temps
     msg.deviceState.wifiIpAddress = last_hw_state.wifi_address
 
+    thermald_diag2_mark(health, 'screen_brightness')
     msg.deviceState.screenBrightnessPercent = HARDWARE.get_screen_brightness()
+    thermald_diag2_mark(health, 'battery_capacity')
     msg.deviceState.batteryPercent = HARDWARE.get_battery_capacity()
+    thermald_diag2_mark(health, 'battery_current')
     msg.deviceState.batteryCurrent = HARDWARE.get_battery_current()
+    thermald_diag2_mark(health, 'usb_present')
     msg.deviceState.usbOnline = HARDWARE.get_usb_present()
     current_filter.update(msg.deviceState.batteryCurrent / 1e6)
 
+    thermald_diag2_mark(health, 'thermal_logic')
     max_comp_temp = temp_filter.update(
       max(max(msg.deviceState.cpuTempC), msg.deviceState.memoryTempC, max(msg.deviceState.gpuTempC))
     )
@@ -366,6 +390,7 @@ def thermald_thread(end_event, hw_queue, health):
       elif current_band.max_temp is not None and max_comp_temp > current_band.max_temp:
         thermal_status = list(THERMAL_BANDS.keys())[band_idx + 1]
 
+    thermald_diag2_mark(health, 'startup_params')
     # **** starting logic ****
 
     # Ensure date/time are valid
@@ -404,6 +429,7 @@ def thermald_thread(end_event, hw_queue, health):
           except Exception:
             pass
 
+    thermald_diag2_mark(health, 'onroad_transition')
     # Handle offroad/onroad transition
     should_start = all(onroad_conditions.values())
     if started_ts is None:
@@ -415,14 +441,18 @@ def thermald_thread(end_event, hw_queue, health):
 
       params.put_bool("IsEngaged", False)
       engaged_prev = False
+      thermald_diag2_mark(health, 'set_power_save')
       HARDWARE.set_power_save(not should_start)
+      thermald_diag2_mark(health, 'engagement_sync')
 
+    thermald_diag2_mark(health, 'engagement_sync')
     if sm.updated['controlsState']:
       engaged = sm['controlsState'].enabled
       if engaged != engaged_prev:
         params.put_bool("IsEngaged", engaged)
         engaged_prev = engaged
 
+      thermald_diag2_mark(health, 'kmsg_write')
       try:
         with open('/dev/kmsg', 'w') as kmsg:
           kmsg.write(f"<3>[thermald] engaged: {engaged}\n")
@@ -442,6 +472,7 @@ def thermald_thread(end_event, hw_queue, health):
       if off_ts is None:
         off_ts = sec_since_boot()
         
+    thermald_diag2_mark(health, 'hotspot_check')
     # opkr hotspot
     if hotspot_on_boot and not hotspot_run and sec_since_boot() > 80:
       os.system("service call wifi 37 i32 0 i32 1 &")
@@ -452,6 +483,7 @@ def thermald_thread(end_event, hw_queue, health):
     power_monitor.calculate(peripheralState, onroad_conditions["ignition"])
     msg.deviceState.offroadPowerUsageUwh = power_monitor.get_power_used()
     msg.deviceState.carBatteryCapacityUwh = max(0, power_monitor.get_car_battery_capacity())
+    thermald_diag2_mark(health, 'power_draw')
     current_power_draw = HARDWARE.get_current_power_draw()  # pylint: disable=assignment-from-none
     if current_power_draw is not None:
       statlog.sample("power_draw", current_power_draw)
@@ -460,9 +492,11 @@ def thermald_thread(end_event, hw_queue, health):
       msg.deviceState.powerDrawW = 0
 
     # Check if we need to disable charging (handled by boardd)
+    thermald_diag2_mark(health, 'charging_status')
     msg.deviceState.chargingDisabled = power_monitor.should_disable_charging(onroad_conditions["ignition"], in_car, off_ts)
 
     # Check if we need to shut down
+    thermald_diag2_mark(health, 'shutdown_check')
     if power_monitor.should_shutdown(peripheralState, onroad_conditions["ignition"], in_car, off_ts, started_seen):
       cloudlog.warning(f"shutting device down, offroad since {off_ts}")
       params.put_bool("DoShutdown", True)
@@ -471,6 +505,7 @@ def thermald_thread(end_event, hw_queue, health):
     msg.deviceState.started = started_ts is not None
     msg.deviceState.startedMonoTime = int(1e9*(started_ts or 0))
 
+    thermald_diag2_mark(health, 'last_athena_ping')
     last_ping = params.get("LastAthenaPingTime")
     if last_ping is not None:
       msg.deviceState.lastAthenaPingTime = int(last_ping)
@@ -539,7 +574,7 @@ def thermald_thread(end_event, hw_queue, health):
 def main():
   hw_queue = queue.Queue(maxsize=1)
   end_event = threading.Event()
-  health = {'last_send': 0.0, 'publishes': 0, 'stage': 'starting', 'stage_ts': time.monotonic()}
+  health = {'last_send': 0.0, 'publishes': 0, 'stage': 'starting', 'stage_ts': time.monotonic(), 'next_slow_log': 0.0}
 
   threads = [
     threading.Thread(target=hw_state_thread, args=(end_event, hw_queue)),
