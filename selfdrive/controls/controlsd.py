@@ -1311,7 +1311,9 @@ class Controls:
       pass
 
   def _hkg_diag2_state(self):
-    # v1.8.12-DIAG2.  Edge triggered: no continuous state logging at 100Hz.
+    # v1.8.13-DIAG3: preserve safety transitions and deviceState alive edges,
+    # but suppress routine enabled <-> overriding (gas/steering) log noise.
+    # Only the diagnostic output changes; never modifies the actual state.
     try:
       now = (str(self.state), bool(self.sm.alive.get('deviceState', False)))
       old = getattr(self, '_hkg_diag2_state_prev', None)
@@ -1319,6 +1321,13 @@ class Controls:
         return
       self._hkg_diag2_state_prev = now
       if old is None:
+        return
+      old_state, old_alive = old
+      new_state, new_alive = now
+      safety_edge = old_state != new_state and (
+        old_state in ('0', '3') or new_state in ('0', '3')
+      )
+      if not (safety_edge or old_alive != new_alive):
         return
       last_rcv = self.sm.rcv_time.get('deviceState', 0.0)
       age = (sec_since_boot() - last_rcv) if last_rcv else -1.0
