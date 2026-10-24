@@ -17,18 +17,19 @@ Sound::Sound(QObject *parent) : sm({"carState", "controlsState", "deviceState"})
   qInfo() << "default audio device: " << QAudioDeviceInfo::defaultOutputDevice().deviceName();
 
   for (auto &[alert, fn, loops] : sound_list) {
+    const auto alert_id = alert;  // C++17: capture a normal local variable, not a structured binding.
     QSoundEffect *s = new QSoundEffect(this);
     QObject::connect(s, &QSoundEffect::statusChanged, [=]() {
       // Existing assertion remains unchanged. Log *before* it for diagnosis.
       if (s->status() == QSoundEffect::Error) {
-        LOGE("HKG_DIAG3_SOUND_ERROR sound=%d status=%d", static_cast<int>(alert), static_cast<int>(s->status()));
+        LOGE("HKG_DIAG3_SOUND_ERROR sound=%d status=%d", static_cast<int>(alert_id), static_cast<int>(s->status()));
       }
       assert(s->status() != QSoundEffect::Error);
     });
     if (alert == AudibleAlert::WARNING_SOFT || alert == AudibleAlert::WARNING_IMMEDIATE) {
-      QObject::connect(s, &QSoundEffect::playingChanged, this, [s, alert]() {
+      QObject::connect(s, &QSoundEffect::playingChanged, this, [s, alert_id]() {
         LOGW("HKG_DIAG3_SOUND_PLAYING sound=%d playing=%d status=%d volume=%.3f",
-             static_cast<int>(alert), static_cast<int>(s->isPlaying()),
+             static_cast<int>(alert_id), static_cast<int>(s->isPlaying()),
              static_cast<int>(s->status()), static_cast<double>(s->volume()));
       });
     }
