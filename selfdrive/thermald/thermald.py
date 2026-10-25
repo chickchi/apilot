@@ -22,6 +22,7 @@ from selfdrive.loggerd.config import get_available_percent
 from selfdrive.statsd import statlog
 from selfdrive.swaglog import cloudlog
 from selfdrive.thermald.power_monitoring import PowerMonitoring
+from selfdrive.thermald.eon_battery_async import EonBatteryAsync
 from selfdrive.thermald.fan_controller import EonFanController, UnoFanController, TiciFanController
 from selfdrive.version import terms_version, training_version
 from selfdrive.ntune import ntune_option_enabled, ntune_option_get
@@ -269,6 +270,10 @@ def thermald_thread(end_event, hw_queue, health):
   #  battery_charging_min = int(params.get("OpkrBatteryChargingMin", encoding="utf8"))
   #  battery_charging_max = int(params.get("OpkrBatteryChargingMax", encoding="utf8"))
 
+  # EON sysfs battery I/O runs outside the deviceState publisher.
+  # Original thermald diagnostics and safeguards remain unchanged.
+  battery_async = EonBatteryAsync(end_event, power_monitor, battery_charging_control, battery_charging_max, battery_charging_min) if EON else None
+
   while not end_event.is_set():
     thermald_diag2_mark(health, 'panda_wait')
     ts = sec_since_boot()
@@ -361,12 +366,18 @@ def thermald_thread(end_event, hw_queue, health):
 
     thermald_diag2_mark(health, 'screen_brightness')
     msg.deviceState.screenBrightnessPercent = HARDWARE.get_screen_brightness()
-    thermald_diag2_mark(health, 'battery_capacity')
-    msg.deviceState.batteryPercent = HARDWARE.get_battery_capacity()
-    thermald_diag2_mark(health, 'battery_current')
-    msg.deviceState.batteryCurrent = HARDWARE.get_battery_current()
-    thermald_diag2_mark(health, 'usb_present')
-    msg.deviceState.usbOnline = HARDWARE.get_usb_present()
+    thermald_diag2_mark(health, 'battery_snapshot')
+    if battery_async is not None:
+      battery_percent, battery_fresh_capacity, battery_fresh_charging, battery_current, usb_online, battery_draw = battery_async.snapshot()
+      msg.deviceState.batteryPercent = battery_percent
+      msg.deviceState.batteryCurrent = battery_current
+      msg.deviceState.usbOnline = usb_online
+    else:
+      # Non-EON devices preserve their existing hardware read behavior.
+      battery_fresh_capacity, battery_fresh_charging, battery_draw = None, None, None
+      msg.deviceState.batteryPercent = HARDWARE.get_battery_capacity()
+      msg.deviceState.batteryCurrent = HARDWARE.get_battery_current()
+      msg.deviceState.usbOnline = HARDWARE.get_usb_present()
     current_filter.update(msg.deviceState.batteryCurrent / 1e6)
 
     thermald_diag2_mark(health, 'thermal_logic')
@@ -484,7 +495,7 @@ def thermald_thread(end_event, hw_queue, health):
     msg.deviceState.offroadPowerUsageUwh = power_monitor.get_power_used()
     msg.deviceState.carBatteryCapacityUwh = max(0, power_monitor.get_car_battery_capacity())
     thermald_diag2_mark(health, 'power_draw')
-    current_power_draw = HARDWARE.get_current_power_draw()  # pylint: disable=assignment-from-none
+    current_power_draw = battery_draw if battery_async is not None else HARDWARE.get_current_power_draw()  # pylint: disable=assignment-from-none
     if current_power_draw is not None:
       statlog.sample("power_draw", current_power_draw)
       msg.deviceState.powerDrawW = current_power_draw
@@ -497,7 +508,7 @@ def thermald_thread(end_event, hw_queue, health):
 
     # Check if we need to shut down
     thermald_diag2_mark(health, 'shutdown_check')
-    if power_monitor.should_shutdown(peripheralState, onroad_conditions["ignition"], in_car, off_ts, started_seen):
+    if power_monitor.should_shutdown(peripheralState, onroad_conditions["ignition"], in_car, off_ts, started_seen, battery_fresh_capacity, battery_fresh_charging, battery_async is not None):
       cloudlog.warning(f"shutting device down, offroad since {off_ts}")
       params.put_bool("DoShutdown", True)
 
@@ -551,7 +562,9 @@ def thermald_thread(end_event, hw_queue, health):
 
     # atom
     thermald_diag2_mark(health, 'charging_ctrl')
-    if usb_power and battery_charging_control:
+    if battery_async is not None:
+      battery_async.set_usb_power(usb_power)
+    elif usb_power and battery_charging_control:
       power_monitor.charging_ctrl(msg, ts, battery_charging_max, battery_charging_min)
 
     # report to server once every 10 minutes
