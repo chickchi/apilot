@@ -202,7 +202,7 @@ class PowerMonitoring:
       self.ts_last_charging_ctrl = ts
 
   # See if we need to shutdown
-  def should_shutdown(self, peripheralState, ignition, in_car, offroad_timestamp, started_seen):
+  def should_shutdown(self, peripheralState, ignition, in_car, offroad_timestamp, started_seen, battery_capacity=None, battery_charging=None, battery_async=False):
     if offroad_timestamp is None:
       return False
 
@@ -213,6 +213,12 @@ class PowerMonitoring:
     should_shutdown = False
     # Wait until we have shut down charging before powering down
     should_shutdown |= (not panda_charging and self.should_disable_charging(ignition, in_car, offroad_timestamp))
-    should_shutdown |= ((HARDWARE.get_battery_capacity() < BATT_PERC_OFF) and (not HARDWARE.get_battery_charging()) and ((now - offroad_timestamp) > 60))
+    # EON only: a stale async battery reading must not perform blocking sysfs I/O
+    # in thermald. Other devices keep the original synchronous shutdown logic.
+    if battery_async:
+      if battery_capacity is not None and battery_charging is not None:
+        should_shutdown |= ((battery_capacity < BATT_PERC_OFF) and (not battery_charging) and ((now - offroad_timestamp) > 60))
+    else:
+      should_shutdown |= ((HARDWARE.get_battery_capacity() < BATT_PERC_OFF) and (not HARDWARE.get_battery_charging()) and ((now - offroad_timestamp) > 60))
     should_shutdown &= started_seen or (now > MIN_ON_TIME_S)
     return should_shutdown
