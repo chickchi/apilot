@@ -1,7 +1,7 @@
 """v1.8.14 EON battery telemetry isolation.
 
-Only the background worker may perform battery capacity/charge-type sysfs reads
-and EON charge-limit I/O. thermald's publisher only reads cached snapshots.
+The background worker performs EON battery and offroad power-monitor
+sysfs I/O. thermald's publisher only reads cached snapshots.
 
 This does not bypass communication failures or any openpilot safety checks.
 """
@@ -33,6 +33,7 @@ class EonBatteryAsync:
     self._timestamp = None
     self._usb_power = False
     self._stale_logged = None
+    self._power_state = None
     self._thread = threading.Thread(target=self._run, name="eon_battery_io", daemon=True)
     self._thread.start()
 
@@ -40,6 +41,16 @@ class EonBatteryAsync:
     # Updated from thermald; the worker never touches charging when false.
     with self._lock:
       self._usb_power = bool(enabled)
+
+  def update_power_state(self, peripheral_state, ignition):
+    # Only copy scalar fields; never share a live Cap'n Proto object across threads.
+    state = None if peripheral_state is None else SimpleNamespace(
+      pandaType=peripheral_state.pandaType,
+      current=peripheral_state.current,
+      voltage=peripheral_state.voltage,
+    )
+    with self._lock:
+      self._power_state = (state, bool(ignition), time.monotonic())
 
   def snapshot(self):
     """Return display and validated battery telemetry without any sysfs I/O.
@@ -87,6 +98,15 @@ class EonBatteryAsync:
         if charge_allowed:
           msg = SimpleNamespace(deviceState=SimpleNamespace(batteryPercent=capacity))
           self._power_monitor.charging_ctrl(msg, sec_since_boot(), self._charge_max, self._charge_min)
+
+        # PowerMonitor offroad measurement may read slow sysfs paths. Run it
+        # here, never in thermald's deviceState publisher.
+        with self._lock:
+          power_state = self._power_state
+        if power_state is not None:
+          peripheral, ignition, updated = power_state
+          if time.monotonic() - updated <= self.MAX_AGE_S:
+            self._power_monitor.calculate(peripheral, ignition)
 
       except Exception:
         cloudlog.exception("HKG_BATT_ASYNC_READ_ERROR")
