@@ -491,7 +491,11 @@ def thermald_thread(end_event, hw_queue, health):
 
     # Offroad power monitoring
     thermald_diag2_mark(health, 'power_monitor')
-    power_monitor.calculate(peripheralState, onroad_conditions["ignition"])
+    if battery_async is not None:
+      power_monitor.update_car_voltage(peripheralState, external=True)
+      battery_async.update_power_state(peripheralState, onroad_conditions["ignition"])
+    else:
+      power_monitor.calculate(peripheralState, onroad_conditions["ignition"])
     msg.deviceState.offroadPowerUsageUwh = power_monitor.get_power_used()
     msg.deviceState.carBatteryCapacityUwh = max(0, power_monitor.get_car_battery_capacity())
     thermald_diag2_mark(health, 'power_draw')
