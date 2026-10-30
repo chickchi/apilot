@@ -38,8 +38,13 @@ class PowerMonitoring:
     self.car_voltage_mV = 12e3                  # Low-passed version of peripheralState voltage
     self.car_voltage_instant_mV = 12e3          # Last value of peripheralState voltage
     self.integration_lock = threading.Lock()
+    self._car_voltage_external_update = False
 
     self.ts_last_charging_ctrl = None
+    # Command latch is independent of charge_type ('N/A' can mean temporary stop).
+    self._charge_limit_target = None
+    # A pulse measurement and the limit controller may never write concurrently.
+    self.charging_io_lock = threading.RLock()
 
     car_battery_capacity_uWh = self.params.get("CarBatteryCapacity")
     if car_battery_capacity_uWh is None:
@@ -47,6 +52,16 @@ class PowerMonitoring:
 
     # Reset capacity if it's low
     self.car_battery_capacity_uWh = max((CAR_BATTERY_CAPACITY_uWh / 10), int(car_battery_capacity_uWh))
+
+  def update_car_voltage(self, peripheral_state, external=False):
+    if peripheral_state is None or peripheral_state.pandaType == log.PandaState.PandaType.unknown:
+      return
+    self.car_voltage_instant_mV = peripheral_state.voltage
+    self.car_voltage_mV = ((peripheral_state.voltage * CAR_VOLTAGE_LOW_PASS_K) +
+                           (self.car_voltage_mV * (1 - CAR_VOLTAGE_LOW_PASS_K)))
+    statlog.gauge("car_voltage", self.car_voltage_mV / 1e3)
+    if external:
+      self._car_voltage_external_update = True
 
   # Calculation tick
   def calculate(self, peripheralState, ignition):
@@ -61,10 +76,9 @@ class PowerMonitoring:
           self.power_used_uWh = 0
         return
 
-      # Low-pass battery voltage
-      self.car_voltage_instant_mV = peripheralState.voltage
-      self.car_voltage_mV = ((peripheralState.voltage * CAR_VOLTAGE_LOW_PASS_K) + (self.car_voltage_mV * (1 - CAR_VOLTAGE_LOW_PASS_K)))
-      statlog.gauge("car_voltage", self.car_voltage_mV / 1e3)
+      # EON main loop handles this quick voltage update at original cadence.
+      if not self._car_voltage_external_update:
+        self.update_car_voltage(peripheralState)
 
       # Cap the car battery power and save it in a param every 10-ish seconds
       self.car_battery_capacity_uWh = max(self.car_battery_capacity_uWh, 0)
@@ -111,22 +125,27 @@ class PowerMonitoring:
           # Turn off charging for about 10 sec in a thread that does not get killed on SIGINT, and perform measurement here to avoid blocking thermal
           def perform_pulse_measurement(now):
             try:
-              HARDWARE.set_battery_charging(False)
-              time.sleep(5)
-
-              # Measure for a few sec to get a good average
-              voltages = []
-              currents = []
-              for _ in range(6):
-                voltages.append(HARDWARE.get_battery_voltage())
-                currents.append(HARDWARE.get_battery_current())
-                time.sleep(1)
-              current_power = ((mean(voltages) / 1000000) * (mean(currents) / 1000000))
-
-              self._perform_integration(now, current_power * FUDGE_FACTOR)
-
-              # Enable charging again
-              HARDWARE.set_battery_charging(True)
+              # Serialize pulse switching with the 70-80% charge-limit latch.
+              with self.charging_io_lock:
+                getter = getattr(HARDWARE, "get_battery_charging_enabled", None)
+                previously_enabled = getter() if callable(getter) else HARDWARE.get_battery_charging()
+                # Never restore a previously disabled/unknown charger switch.
+                turned_off_for_pulse = previously_enabled is True and self._charge_limit_target is not False
+                try:
+                  if turned_off_for_pulse:
+                    HARDWARE.set_battery_charging(False)
+                    time.sleep(5)
+                  voltages = []
+                  currents = []
+                  for _ in range(6):
+                    voltages.append(HARDWARE.get_battery_voltage())
+                    currents.append(HARDWARE.get_battery_current())
+                    time.sleep(1)
+                  current_power = ((mean(voltages) / 1000000) * (mean(currents) / 1000000))
+                  self._perform_integration(now, current_power * FUDGE_FACTOR)
+                finally:
+                  if turned_off_for_pulse and self._charge_limit_target is not False:
+                    HARDWARE.set_battery_charging(True)
             except Exception:
               cloudlog.exception("Pulsed power measurement failed")
 
@@ -187,19 +206,34 @@ class PowerMonitoring:
     disable_charging |= self.params.get_bool("ForcePowerDown")
     return disable_charging
 
-  #OPKR
-  def charging_ctrl(self, msg, ts, to_discharge, to_charge ):
-    if self.ts_last_charging_ctrl is None or (ts - self.ts_last_charging_ctrl) >= 30.:
-      battery_changing = HARDWARE.get_battery_charging()
-      print('Battery charging', battery_changing)
-      if self.ts_last_charging_ctrl:
-        if msg.deviceState.batteryPercent >= to_discharge and battery_changing:
-          HARDWARE.set_battery_charging(False)
-          print('charging off')
-        elif msg.deviceState.batteryPercent <= to_charge and not battery_changing:
-          HARDWARE.set_battery_charging(True)
-          print('charging on')
-      self.ts_last_charging_ctrl = ts
+  #OPKR: hysteresis operates on the commanded charging switch, not charge_type.
+  def charging_ctrl(self, msg, ts, to_discharge, to_charge):
+    if self.ts_last_charging_ctrl is not None and (ts - self.ts_last_charging_ctrl) < 30.:
+      return
+    self.ts_last_charging_ctrl = ts
+    if not (0 <= to_charge < to_discharge <= 100):
+      cloudlog.error("HKG_BATT_CHARGE_INVALID_LIMITS min=%s max=%s", to_charge, to_discharge)
+      return
+
+    capacity = msg.deviceState.batteryPercent
+    with self.charging_io_lock:
+      if capacity >= to_discharge:
+        self._charge_limit_target = False
+      elif capacity <= to_charge:
+        self._charge_limit_target = True
+      # Between 70 and 80, retain the last decision; on initial boot
+      # within that band do not force an unverified previous state.
+      target = self._charge_limit_target
+      if target is None:
+        return
+      getter = getattr(HARDWARE, "get_battery_charging_enabled", None)
+      enabled = getter() if callable(getter) else None
+      # Missing/unreadable command state is UNKNOWN, never infer it from
+      # charge_type: a transient N/A must not prevent an explicit OFF.
+      if enabled is None or bool(enabled) != target:
+        HARDWARE.set_battery_charging(target)
+        cloudlog.warning("HKG_BATT_CHARGE_CONTROL capacity=%s target=%s", capacity,
+                         "ON" if target else "OFF")
 
   # See if we need to shutdown
   def should_shutdown(self, peripheralState, ignition, in_car, offroad_timestamp, started_seen, battery_capacity=None, battery_charging=None, battery_async=False):
