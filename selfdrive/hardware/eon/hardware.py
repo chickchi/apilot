@@ -365,6 +365,11 @@ class Android(HardwareBase):
     # This does correspond with actually charging
     return self.read_param_file("/sys/class/power_supply/battery/charge_type", lambda x: x.strip() != "N/A", True)
 
+  def get_battery_charging_enabled(self):
+    # Command state, not the physical charge_type indication. EON async worker only.
+    return self.read_param_file("/sys/class/power_supply/battery/charging_enabled",
+                                lambda x: bool(int(x)), None)
+
   def set_battery_charging(self, on):
     print('set_battery_charging=', on)
     with open('/sys/class/power_supply/battery/charging_enabled', 'w') as f:
